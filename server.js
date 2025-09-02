@@ -3,12 +3,8 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
-// ---------- helpers: μ-law <-> PCM16 + simple resampling ----------
-const SIGN_BIT = 0x80;
-const QUANT_MASK = 0x0F;
-const SEG_SHIFT = 4;
-const SEG_MASK = 0x70;
-
+// ---------- μ-law helpers (fallback only) ----------
+const SIGN_BIT = 0x80, QUANT_MASK = 0x0F, SEG_SHIFT = 4, SEG_MASK = 0x70;
 function ulawToLinear(u_val) {
   u_val = ~u_val & 0xFF;
   let t = ((u_val & QUANT_MASK) << 3) + 0x84;
@@ -36,17 +32,42 @@ function downsample16kTo8k(int16) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = int16[i];
   return out;
 }
-function twilioPayloadToPCM16k(payloadB64) {
-  const ulaw = Buffer.from(payloadB64, 'base64');
-  const pcm8 = new Int16Array(ulaw.length);
-  for (let i = 0; i < ulaw.length; i++) pcm8[i] = ulawToLinear(ulaw[i]);
-  return upsample8kTo16k(pcm8);
+
+// ---------- Twilio <-> OpenAI audio utils ----------
+const TWILIO_ULAW_BYTES_PER_20MS = 160; // 8kHz * 0.02s * 1 byte/μ-law sample
+function chunkAndSendUlawBase64ToTwilio(b64Ulaw, twilioWS, streamSid, counters) {
+  // Decode once to byte Buffer, then re-chunk into 20ms (160-byte) frames and re-encode
+  const bytes = Buffer.from(b64Ulaw, 'base64');
+  for (let off = 0; off < bytes.length; off += TWILIO_ULAW_BYTES_PER_20MS) {
+    const slice = bytes.subarray(off, Math.min(off + TWILIO_ULAW_BYTES_PER_20MS, bytes.length));
+    if (slice.length === 0) continue;
+    const payload = slice.toString('base64');
+    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+    counters.sentChunks++;
+    if (counters.sentChunks % 10 === 0) {
+      console.log(`Audio → Twilio: sent ${counters.sentChunks} chunks`);
+    }
+  }
 }
-function pcm16kToTwilioPayload(int16) {
+
+// Fallback: if OpenAI ever sends PCM16 @ 16k in binary, convert → μ-law @ 8k and send
+function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters) {
+  const int16 = new Int16Array(binaryBuf.buffer, binaryBuf.byteOffset, binaryBuf.byteLength / 2);
+  // downsample 16k -> 8k (every other sample)
   const pcm8 = downsample16kTo8k(int16);
-  const out = Buffer.alloc(pcm8.length);
-  for (let i = 0; i < pcm8.length; i++) out[i] = linearToUlaw(pcm8[i]);
-  return out.toString('base64');
+  // μ-law encode
+  const ulaw = Buffer.alloc(pcm8.length);
+  for (let i = 0; i < pcm8.length; i++) ulaw[i] = linearToUlaw(pcm8[i]);
+  // chunk and send
+  for (let off = 0; off < ulaw.length; off += TWILIO_ULAW_BYTES_PER_20MS) {
+    const slice = ulaw.subarray(off, Math.min(off + TWILIO_ULAW_BYTES_PER_20MS, ulaw.length));
+    const payload = slice.toString('base64');
+    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+    counters.sentChunks++;
+    if (counters.sentChunks % 10 === 0) {
+      console.log(`Audio → Twilio (fallback): sent ${counters.sentChunks} chunks`);
+    }
+  }
 }
 
 // ---------- minimal app ----------
@@ -63,8 +84,7 @@ const wss = new WebSocketServer({ server, path: '/media' });
 wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
-  let frames = 0; // count inbound frames so we know if buffer has audio
-  let audioChunksSent = 0; // track audio sent back to Twilio
+  const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
@@ -76,20 +96,20 @@ wss.on('connection', (twilioWS, req) => {
 
   aiWS.on('open', () => {
     console.log('AI: connected');
-
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
-    // Configure session: voice, server VAD, and PCM16 I/O
+
+    // *** Use μ-law both directions to avoid conversion/static ***
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: desiredVoice,
         turn_detection: { type: 'server_vad', threshold: 0.6 },
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16'
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw'
       }
     }));
 
-    // TEMP one-shot: confirm return audio path
+    // One-shot test line so we can confirm return audio path
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: {
@@ -99,47 +119,51 @@ wss.on('connection', (twilioWS, req) => {
     }));
   });
 
-  aiWS.on('message', (raw) => {
+  aiWS.on('message', (raw, isBinary) => {
+    if (!streamSid) return; // wait until Twilio gave us a streamSid
+
+    // If model ever sends binary PCM16@16k, convert → μ-law and forward
+    if (isBinary) {
+      sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
+      return;
+    }
+
+    // Otherwise expect JSON events
     try {
       const msg = JSON.parse(raw.toString());
 
-      // log useful events for visibility (exclude audio deltas to reduce noise)
-      if (msg?.type && !['response.audio.delta'].includes(msg.type)) {
-        console.log('AI event:', msg.type);
+      // Debug ALL events except audio deltas (too chatty)
+      if (!['response.audio.delta', 'response.output_audio.delta'].includes(msg?.type)) {
+        console.log('AI event:', msg?.type);
       }
 
-      // ✅ FIXED: Use correct event name from your logs: response.audio.delta
-      if (msg.type === 'response.audio.delta' && (msg.audio || msg.delta) && streamSid) {
-        const b64 = msg.audio || msg.delta; // handle either field name
-        const pcm = Buffer.from(b64, 'base64');
-        const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-        const payload = pcm16kToTwilioPayload(int16);
-        
-        // Send audio back to Twilio
-        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-        
-        // Log every 10th audio chunk to confirm audio is flowing
-        audioChunksSent++;
-        if (audioChunksSent % 10 === 0) {
-          console.log(`Audio: sent ${audioChunksSent} chunks to Twilio (${b64.length} chars -> ${payload.length} chars)`);
+      // Handle both event names, both field names (delta | audio)
+      if ((msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta')) {
+        const b64 = msg.delta || msg.audio;
+        if (!b64) {
+          console.log('Audio event without data');
+          return;
         }
+        // Already μ-law @ 8k (because output_audio_format=g711_ulaw)
+        chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
-    } catch (err) {
-      console.log('AI: Failed to parse message:', err.message);
+    } catch (e) {
+      console.log('AI: failed to parse message', e?.message);
     }
   });
 
   aiWS.on('close', () => {
     console.log('AI: closed');
-    console.log(`Session summary: received ${frames} frames, sent ${audioChunksSent} audio chunks`);
+    console.log(`Session summary: received ${counters.frames} frames, sent ${counters.sentChunks} audio chunks`);
   });
   aiWS.on('error', (err) => console.log('AI: error', err?.message));
 
   twilioWS.on('message', (msg) => {
     try {
       const data = JSON.parse(msg.toString());
+
       switch (data.event) {
         case 'connected':
           console.log('WS: connected event');
@@ -148,38 +172,34 @@ wss.on('connection', (twilioWS, req) => {
         case 'start':
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
-          frames = 0;
-          audioChunksSent = 0;
+          counters.frames = 0;
+          counters.sentChunks = 0;
+          // Clear any prior input buffer (optional)
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
           break;
 
-        case 'media': {
-          frames++;
-          if (frames % 100 === 0) console.log('WS: frames', frames);
-          const pcm16 = twilioPayloadToPCM16k(data.media.payload);
-          const b = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-          if (aiWS.readyState === 1) {
+        case 'media':
+          counters.frames++;
+          if (counters.frames % 100 === 0) console.log('WS: frames', counters.frames);
+          // Twilio payload is already μ-law base64; pass straight through to OpenAI
+          if (aiWS.readyState === 1 && data.media?.payload) {
             aiWS.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: b.toString('base64')
+              audio: data.media.payload
             }));
           }
           break;
-        }
 
         case 'stop':
-          console.log('WS: stream stopped (frames received:', frames, ')');
-          // Only commit if we actually appended audio
-          if (frames > 0 && aiWS.readyState === 1) {
-            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-          }
+          console.log('WS: stream stopped (frames received:', counters.frames, ')');
+          // Do NOT commit on stop — avoids empty-buffer errors; VAD commits turns.
           try { twilioWS.close(); } catch {}
           break;
       }
-    } catch (err) {
-      console.log('WS: Failed to parse message:', err.message);
+    } catch (e) {
+      console.log('WS: failed to parse message', e?.message);
     }
   });
 
