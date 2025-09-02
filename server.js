@@ -101,12 +101,17 @@ wss.on('connection', (twilioWS, req) => {
   aiWS.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      // Helpful debug to see what the model sends
-      if (msg?.type && msg.type !== 'response.audio.delta') {
+
+      // log useful events for visibility
+      if (msg?.type && !['response.output_audio.delta'].includes(msg.type)) {
+        // this mirrors what you saw in logs (transcript deltas, etc.)
         console.log('AI event:', msg.type);
       }
-      if (msg.type === 'response.audio.delta' && msg.audio && streamSid) {
-        const pcm = Buffer.from(msg.audio, 'base64');
+
+      // ✅ Correct event name: response.output_audio.delta
+      if (msg.type === 'response.output_audio.delta' && (msg.audio || msg.delta) && streamSid) {
+        const b64 = msg.audio || msg.delta; // handle either field name
+        const pcm = Buffer.from(b64, 'base64');
         const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
         const payload = pcm16kToTwilioPayload(int16);
         twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
