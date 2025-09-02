@@ -49,26 +49,12 @@ function pcm16kToTwilioPayload(int16) {
   return out.toString('base64');
 }
 
-// ---------- minimal app + test endpoints ----------
+// ---------- minimal app ----------
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/warmup', (_req, res) => res.status(204).end());
-
-// optional: Sheets test helpers preserved from earlier
-async function sendToSheet(payload) {
-  const webhook = process.env.WEBHOOK_URL;
-  if (!webhook) throw new Error('WEBHOOK_URL not set');
-  const resp = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  const text = await resp.text();
-  return { status: resp.status, body: text };
-}
-function testPayload(note = 'GET /logs/test appended this row.') {
-  return { from:'+10000000000', to:'+10000000001', call_sid:`TEST_${Date.now()}`, caller_name:'Test Caller', vip_name:'', vip_role:'', business:'', intent:'test', summary:note, action_items:['Example item'], spam:false, dnc_attempted:false, dnc_result:'', recording_url:'', transcript:'This is only a test.' };
-}
-app.get('/logs/test', async (_req, res) => { try { const r = await sendToSheet(testPayload()); res.status(200).send(`OK — test row appended to your Sheet. Webhook status: ${r.status}`); } catch(e){ res.status(500).send(`Error: ${String(e)}`); }});
-app.post('/logs/test', async (_req, res) => { try { const r = await sendToSheet(testPayload('POST /logs/test appended this row.')); res.json({ ok:true, webhook_status:r.status, body:r.body }); } catch(e){ res.status(500).json({ ok:false, error:String(e) }); }});
 
 // ---------- HTTP server + /media WebSocket ----------
 const server = createServer(app);
@@ -77,34 +63,31 @@ const wss = new WebSocketServer({ server, path: '/media' });
 wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
+  let frames = 0; // ← count inbound frames so we know if buffer has audio
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
   const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
-
   const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
 
   aiWS.on('open', () => {
     console.log('AI: connected');
 
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
-
-    // ✅ FIX 1: audio format strings, not objects
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: desiredVoice,
         turn_detection: { type: 'server_vad', threshold: 0.6 },
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16'
+        input_audio_format: 'pcm16',   // string (not object)
+        output_audio_format: 'pcm16'   // string (not object)
       }
     }));
 
-    // ✅ FIX 2: include both modalities
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
+        modalities: ['audio','text'], // both
         instructions:
           "You are Trinity, phone AI for Father Dan. After this greeting, listen and respond concisely. If the caller interrupts, stop speaking and listen. Keep a warm, upbeat tone."
       }
@@ -123,7 +106,7 @@ wss.on('connection', (twilioWS, req) => {
         console.log('AI error:', msg.error || msg);
       }
     } catch {
-      // OpenAI may send binary frames; ignore here
+      // ignore non-JSON frames from OpenAI
     }
   });
 
@@ -136,30 +119,42 @@ wss.on('connection', (twilioWS, req) => {
       switch (data.event) {
         case 'connected':
           console.log('WS: connected event'); break;
+
         case 'start':
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
-          aiWS.readyState === 1 && aiWS.send(JSON.stringify({ type:'input_audio_buffer.clear' }));
+          frames = 0;
+          if (aiWS.readyState === 1) aiWS.send(JSON.stringify({ type:'input_audio_buffer.clear' }));
           break;
+
         case 'media': {
+          frames++;
+          if (frames % 50 === 0) console.log('WS: frames', frames);
           const pcm16 = twilioPayloadToPCM16k(data.media.payload);
           const b = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
-          aiWS.readyState === 1 && aiWS.send(JSON.stringify({ type:'input_audio_buffer.append', audio: b.toString('base64') }));
+          if (aiWS.readyState === 1) {
+            aiWS.send(JSON.stringify({ type:'input_audio_buffer.append', audio: b.toString('base64') }));
+          }
           break;
         }
+
         case 'stop':
-          console.log('WS: stream stopped');
-          aiWS.readyState === 1 && aiWS.send(JSON.stringify({ type:'input_audio_buffer.commit' }));
+          console.log('WS: stream stopped (frames received:', frames, ')');
+          // Only commit if we actually appended audio
+          if (frames > 0 && aiWS.readyState === 1) {
+            aiWS.send(JSON.stringify({ type:'input_audio_buffer.commit' }));
+          }
           try { twilioWS.close(); } catch {}
           break;
       }
-    } catch { /* ignore non-JSON */ }
+    } catch {
+      // ignore non-JSON
+    }
   });
 
   twilioWS.on('close', () => { if (aiWS.readyState === 1) aiWS.close(); console.log('WS: connection closed'); });
   twilioWS.on('error', (err) => console.log('WS: error', err?.message));
 });
 
-// ---------- start ----------
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
