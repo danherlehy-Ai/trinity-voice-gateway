@@ -64,6 +64,7 @@ wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
   let frames = 0; // count inbound frames so we know if buffer has audio
+  let audioChunksSent = 0; // track audio sent back to Twilio
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
@@ -102,28 +103,38 @@ wss.on('connection', (twilioWS, req) => {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // log useful events for visibility
-      if (msg?.type && !['response.output_audio.delta'].includes(msg.type)) {
-        // this mirrors what you saw in logs (transcript deltas, etc.)
+      // log useful events for visibility (exclude audio deltas to reduce noise)
+      if (msg?.type && !['response.audio.delta'].includes(msg.type)) {
         console.log('AI event:', msg.type);
       }
 
-      // ✅ Correct event name: response.output_audio.delta
-      if (msg.type === 'response.output_audio.delta' && (msg.audio || msg.delta) && streamSid) {
+      // ✅ FIXED: Use correct event name from your logs: response.audio.delta
+      if (msg.type === 'response.audio.delta' && (msg.audio || msg.delta) && streamSid) {
         const b64 = msg.audio || msg.delta; // handle either field name
         const pcm = Buffer.from(b64, 'base64');
         const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
         const payload = pcm16kToTwilioPayload(int16);
+        
+        // Send audio back to Twilio
         twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
+        
+        // Log every 10th audio chunk to confirm audio is flowing
+        audioChunksSent++;
+        if (audioChunksSent % 10 === 0) {
+          console.log(`Audio: sent ${audioChunksSent} chunks to Twilio (${b64.length} chars -> ${payload.length} chars)`);
+        }
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
-    } catch {
-      // Ignore non-JSON frames from OpenAI (not expected, but harmless)
+    } catch (err) {
+      console.log('AI: Failed to parse message:', err.message);
     }
   });
 
-  aiWS.on('close', () => console.log('AI: closed'));
+  aiWS.on('close', () => {
+    console.log('AI: closed');
+    console.log(`Session summary: received ${frames} frames, sent ${audioChunksSent} audio chunks`);
+  });
   aiWS.on('error', (err) => console.log('AI: error', err?.message));
 
   twilioWS.on('message', (msg) => {
@@ -138,6 +149,7 @@ wss.on('connection', (twilioWS, req) => {
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           frames = 0;
+          audioChunksSent = 0;
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
@@ -145,7 +157,7 @@ wss.on('connection', (twilioWS, req) => {
 
         case 'media': {
           frames++;
-          if (frames % 50 === 0) console.log('WS: frames', frames);
+          if (frames % 100 === 0) console.log('WS: frames', frames);
           const pcm16 = twilioPayloadToPCM16k(data.media.payload);
           const b = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
           if (aiWS.readyState === 1) {
@@ -166,8 +178,8 @@ wss.on('connection', (twilioWS, req) => {
           try { twilioWS.close(); } catch {}
           break;
       }
-    } catch {
-      // ignore non-JSON from Twilio
+    } catch (err) {
+      console.log('WS: Failed to parse message:', err.message);
     }
   });
 
