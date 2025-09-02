@@ -63,33 +63,37 @@ const wss = new WebSocketServer({ server, path: '/media' });
 wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
-  let frames = 0; // ← count inbound frames so we know if buffer has audio
+  let frames = 0; // count inbound frames so we know if buffer has audio
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
+  const headers = {
+    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    'OpenAI-Beta': 'realtime=v1',
+  };
   const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
 
   aiWS.on('open', () => {
     console.log('AI: connected');
 
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
+    // Configure session: voice, server VAD, and PCM16 I/O
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: desiredVoice,
         turn_detection: { type: 'server_vad', threshold: 0.6 },
-        input_audio_format: 'pcm16',   // string (not object)
-        output_audio_format: 'pcm16'   // string (not object)
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16'
       }
     }));
 
+    // TEMP one-shot: confirm return audio path
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: {
-        modalities: ['audio','text'], // both
-        instructions:
-          "You are Trinity, phone AI for Father Dan. After this greeting, listen and respond concisely. If the caller interrupts, stop speaking and listen. Keep a warm, upbeat tone."
+        modalities: ['audio', 'text'],
+        instructions: 'Say: "I am connected and listening." Then wait quietly for the caller.'
       }
     }));
   });
@@ -97,16 +101,20 @@ wss.on('connection', (twilioWS, req) => {
   aiWS.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+      // Helpful debug to see what the model sends
+      if (msg?.type && msg.type !== 'response.audio.delta') {
+        console.log('AI event:', msg.type);
+      }
       if (msg.type === 'response.audio.delta' && msg.audio && streamSid) {
         const pcm = Buffer.from(msg.audio, 'base64');
-        const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength/2);
+        const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
         const payload = pcm16kToTwilioPayload(int16);
-        twilioWS.send(JSON.stringify({ event:'media', streamSid, media:{ payload } }));
+        twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
     } catch {
-      // ignore non-JSON frames from OpenAI
+      // Ignore non-JSON frames from OpenAI (not expected, but harmless)
     }
   });
 
@@ -118,13 +126,16 @@ wss.on('connection', (twilioWS, req) => {
       const data = JSON.parse(msg.toString());
       switch (data.event) {
         case 'connected':
-          console.log('WS: connected event'); break;
+          console.log('WS: connected event');
+          break;
 
         case 'start':
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           frames = 0;
-          if (aiWS.readyState === 1) aiWS.send(JSON.stringify({ type:'input_audio_buffer.clear' }));
+          if (aiWS.readyState === 1) {
+            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+          }
           break;
 
         case 'media': {
@@ -133,7 +144,10 @@ wss.on('connection', (twilioWS, req) => {
           const pcm16 = twilioPayloadToPCM16k(data.media.payload);
           const b = Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength);
           if (aiWS.readyState === 1) {
-            aiWS.send(JSON.stringify({ type:'input_audio_buffer.append', audio: b.toString('base64') }));
+            aiWS.send(JSON.stringify({
+              type: 'input_audio_buffer.append',
+              audio: b.toString('base64')
+            }));
           }
           break;
         }
@@ -142,17 +156,20 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: stream stopped (frames received:', frames, ')');
           // Only commit if we actually appended audio
           if (frames > 0 && aiWS.readyState === 1) {
-            aiWS.send(JSON.stringify({ type:'input_audio_buffer.commit' }));
+            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
           }
           try { twilioWS.close(); } catch {}
           break;
       }
     } catch {
-      // ignore non-JSON
+      // ignore non-JSON from Twilio
     }
   });
 
-  twilioWS.on('close', () => { if (aiWS.readyState === 1) aiWS.close(); console.log('WS: connection closed'); });
+  twilioWS.on('close', () => {
+    if (aiWS.readyState === 1) aiWS.close();
+    console.log('WS: connection closed');
+  });
   twilioWS.on('error', (err) => console.log('WS: error', err?.message));
 });
 
