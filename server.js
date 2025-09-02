@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
-import { WebSocketServer, WebSocket } from 'ws';  // ← must include WebSocket
+import { WebSocketServer, WebSocket } from 'ws';
 
 // ---------- helpers: μ-law <-> PCM16 + simple resampling ----------
 const SIGN_BIT = 0x80;
@@ -49,12 +49,14 @@ function pcm16kToTwilioPayload(int16) {
   return out.toString('base64');
 }
 
-// ---------- google sheets test endpoints ----------
+// ---------- minimal app + test endpoints ----------
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/warmup', (_req, res) => res.status(204).end());
+
+// optional: Sheets test helpers preserved from earlier
 async function sendToSheet(payload) {
   const webhook = process.env.WEBHOOK_URL;
   if (!webhook) throw new Error('WEBHOOK_URL not set');
@@ -84,17 +86,29 @@ wss.on('connection', (twilioWS, req) => {
 
   aiWS.on('open', () => {
     console.log('AI: connected');
+
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
-    aiWS.send(JSON.stringify({ type: 'session.update', session: {
-      voice: desiredVoice,
-      turn_detection: { type: 'server_vad', threshold: 0.6 },
-      input_audio_format: { type: 'pcm16', sample_rate: 16000 },
-      output_audio_format: { type: 'pcm16', sample_rate: 16000 }
-    }}));
-    aiWS.send(JSON.stringify({ type:'response.create', response:{
-      modalities:['audio'],
-      instructions:"You are Trinity, phone AI for Father Dan. After this greeting, listen and respond concisely. If the caller interrupts, stop speaking and listen. Keep a warm, upbeat tone."
-    }}));
+
+    // ✅ FIX 1: audio format strings, not objects
+    aiWS.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        voice: desiredVoice,
+        turn_detection: { type: 'server_vad', threshold: 0.6 },
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16'
+      }
+    }));
+
+    // ✅ FIX 2: include both modalities
+    aiWS.send(JSON.stringify({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions:
+          "You are Trinity, phone AI for Father Dan. After this greeting, listen and respond concisely. If the caller interrupts, stop speaking and listen. Keep a warm, upbeat tone."
+      }
+    }));
   });
 
   aiWS.on('message', (raw) => {
@@ -108,7 +122,9 @@ wss.on('connection', (twilioWS, req) => {
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
-    } catch { /* OpenAI may send binary frames we ignore */ }
+    } catch {
+      // OpenAI may send binary frames; ignore here
+    }
   });
 
   aiWS.on('close', () => console.log('AI: closed'));
