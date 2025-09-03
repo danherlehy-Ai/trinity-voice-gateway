@@ -3,8 +3,11 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
-// ---------- μ-law helpers (fallback only) ----------
+/* =============================================================================
+   μ-law helpers (fallback only)
+============================================================================= */
 const SIGN_BIT = 0x80, QUANT_MASK = 0x0F, SEG_SHIFT = 4, SEG_MASK = 0x70;
+
 function ulawToLinear(u_val) {
   u_val = ~u_val & 0xFF;
   let t = ((u_val & QUANT_MASK) << 3) + 0x84;
@@ -24,7 +27,7 @@ function linearToUlaw(sample) {
 }
 function upsample8kTo16k(int16) {
   const out = new Int16Array(int16.length * 2);
-  for (let i = 0; i < int16.length; i++) { out[2*i] = int16[i]; out[2*i+1] = int16[i]; }
+  for (let i = 0; i < int16.length; i++) { out[2 * i] = int16[i]; out[2 * i + 1] = int16[i]; }
   return out;
 }
 function downsample16kTo8k(int16) {
@@ -33,76 +36,87 @@ function downsample16kTo8k(int16) {
   return out;
 }
 
-// ---------- Twilio <-> OpenAI audio utils ----------
+/* =============================================================================
+   Twilio <-> OpenAI audio utils
+============================================================================= */
 const TWILIO_ULAW_BYTES_PER_20MS = 160; // 8kHz * 0.02s * 1 byte/μ-law sample
+
 function chunkAndSendUlawBase64ToTwilio(b64Ulaw, twilioWS, streamSid, counters) {
-  // Decode once to byte Buffer, then re-chunk into 20ms (160-byte) frames and re-encode
   const bytes = Buffer.from(b64Ulaw, 'base64');
   for (let off = 0; off < bytes.length; off += TWILIO_ULAW_BYTES_PER_20MS) {
     const slice = bytes.subarray(off, Math.min(off + TWILIO_ULAW_BYTES_PER_20MS, bytes.length));
-    if (slice.length === 0) continue;
+    if (!slice.length) continue;
     const payload = slice.toString('base64');
     twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-    counters.sentChunks++;
-    if (counters.sentChunks % 10 === 0) {
-      console.log(`Audio → Twilio: sent ${counters.sentChunks} chunks`);
-    }
+    if (++counters.sentChunks % 10 === 0) console.log(`Audio → Twilio: sent ${counters.sentChunks} chunks`);
   }
 }
 
-// Fallback: if OpenAI ever sends PCM16 @ 16k in binary, convert → μ-law @ 8k and send
+// Fallback: if OpenAI ever sends PCM16@16k in binary, convert → μ-law@8k and send
 function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters) {
   const int16 = new Int16Array(binaryBuf.buffer, binaryBuf.byteOffset, binaryBuf.byteLength / 2);
-  // downsample 16k -> 8k (every other sample)
   const pcm8 = downsample16kTo8k(int16);
-  // μ-law encode
   const ulaw = Buffer.alloc(pcm8.length);
   for (let i = 0; i < pcm8.length; i++) ulaw[i] = linearToUlaw(pcm8[i]);
-  // chunk and send
   for (let off = 0; off < ulaw.length; off += TWILIO_ULAW_BYTES_PER_20MS) {
     const slice = ulaw.subarray(off, Math.min(off + TWILIO_ULAW_BYTES_PER_20MS, ulaw.length));
-    const payload = slice.toString('base64');
-    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-    counters.sentChunks++;
-    if (counters.sentChunks % 10 === 0) {
-      console.log(`Audio → Twilio (fallback): sent ${counters.sentChunks} chunks`);
-    }
+    twilioWS.send(JSON.stringify({ event: 'media', streamSid, media: { payload: slice.toString('base64') } }));
+    if (++counters.sentChunks % 10 === 0) console.log(`Audio → Twilio (fallback): sent ${counters.sentChunks} chunks`);
   }
 }
 
-// ---------- minimal app ----------
+/* =============================================================================
+   Minimal app
+============================================================================= */
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/warmup', (_req, res) => res.status(204).end());
 
-// ---------- HTTP server + /media WebSocket ----------
+/* =============================================================================
+   HTTP server + /media WebSocket
+============================================================================= */
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
-// Config source (Google Apps Script Web App)
-const CONFIG_URL =
-  process.env.GOOGLE_CONFIG_URL ||
-  'https://script.google.com/macros/s/AKfycbyznDl5tePAa-xijAgm-MaJ74II4ACWm302k_Xtm_bjlzXUAPidWedi7cK3CgAHJV5I/exec';
+/* ---------- Config source (Google Apps Script Web App) ----------
+
+   IMPORTANT: set GOOGLE_CONFIG_URL in Render to your *current* Apps Script
+   web-app URL (…/exec). If unset, we log a warning and continue with a tiny
+   fallback prompt so calls still connect.
+----------------------------------------------------------------- */
+const CONFIG_URL = process.env.GOOGLE_CONFIG_URL || '';
+if (!CONFIG_URL) {
+  console.warn('GOOGLE_CONFIG_URL is not set. Using a minimal fallback prompt.');
+}
 
 async function fetchConfig() {
   try {
+    if (!CONFIG_URL) throw new Error('missing GOOGLE_CONFIG_URL');
     const res = await fetch(CONFIG_URL, { method: 'GET' });
     if (!res.ok) throw new Error(`Config HTTP ${res.status}`);
     const json = await res.json();
     if (!json?.ok) throw new Error(`Config error: ${JSON.stringify(json)}`);
-    const system_prompt = (json.system_prompt || '').toString();
+    const system_prompt = String(json.system_prompt || '');
     const vips = Array.isArray(json.vips) ? json.vips : [];
     const businesses = Array.isArray(json.businesses) ? json.businesses : [];
-    console.log(`Config: loaded prompt (${system_prompt.length} chars), vips=${vips.length}, businesses=${businesses.length}`);
+    console.log(`Config OK: prompt=${system_prompt.length} chars, vips=${vips.length}, businesses=${businesses.length}`);
     return { system_prompt, vips, businesses };
   } catch (err) {
     console.log('Config fetch failed:', err?.message);
-    return { system_prompt: 'You are Trinity.', vips: [], businesses: [] };
+    return { system_prompt: 'You are Trinity. Speak English only.', vips: [], businesses: [] };
   }
 }
 
+/* ---------- English guard (hard rule) ---------- */
+const ENGLISH_GUARD =
+  "IMPORTANT: Default language is English (United States). " +
+  "Always speak English unless the caller explicitly asks to switch. " +
+  "If the caller begins in Spanish, reply in English: " +
+  "\"I can switch to Spanish if you prefer—just say Spanish.\" Do not switch automatically.";
+
+/* ---------- WebSocket bridge ---------- */
 wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
@@ -120,10 +134,13 @@ wss.on('connection', (twilioWS, req) => {
     console.log('AI: connected');
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
 
-    // ---- NEW: fetch prompt/VIPs/Businesses from Google Apps Script
+    // Fetch prompt/config (from your Apps Script) once per call
     const { system_prompt } = await fetchConfig();
 
-    // Configure session: voice + VAD + μ-law I/O + instructions from Sheet
+    const sessionInstructions = `${ENGLISH_GUARD}\n\n${system_prompt || ''}`;
+    console.log('Applying instructions length:', sessionInstructions.length);
+
+    // Configure session: voice + VAD + μ-law I/O + English guard + your prompt
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -131,46 +148,43 @@ wss.on('connection', (twilioWS, req) => {
         turn_detection: { type: 'server_vad', threshold: 0.6 },
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        instructions: system_prompt || 'You are Trinity.'
+        instructions: sessionInstructions
       }
     }));
 
-    // One-shot line so we can confirm return audio path
+    // Belt-and-suspenders: seed the first response with the English rule as well.
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: {
         modalities: ['audio', 'text'],
-        instructions: 'I am connected and listening.'
+        instructions:
+          "Speak in English. Say: \"I am connected and listening.\" Then wait quietly for the caller. " +
+          "Do not switch languages unless the caller explicitly asks."
       }
     }));
   });
 
   aiWS.on('message', (raw, isBinary) => {
-    if (!streamSid) return; // wait until Twilio gave us a streamSid
+    if (!streamSid) return; // wait until Twilio gives us a streamSid
 
-    // If model ever sends binary PCM16@16k, convert → μ-law and forward
     if (isBinary) {
+      // Fallback: if OpenAI sends PCM16@16k, convert → μ-law@8k for Twilio
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
       return;
     }
 
-    // Otherwise expect JSON events
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Debug ALL events except audio deltas (too chatty)
+      // Log all events except the very chatty audio deltas
       if (!['response.audio.delta', 'response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
 
-      // Handle both event names, both field names (delta | audio)
-      if ((msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta')) {
+      if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
         const b64 = msg.delta || msg.audio;
-        if (!b64) {
-          console.log('Audio event without data');
-          return;
-        }
-        // Already μ-law @ 8k (because output_audio_format=g711_ulaw)
+        if (!b64) return console.log('Audio event without data');
+        // Already μ-law @ 8k (output_audio_format=g711_ulaw)
         chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
@@ -200,7 +214,6 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0;
           counters.sentChunks = 0;
-          // Clear any prior input buffer (optional)
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
@@ -209,18 +222,17 @@ wss.on('connection', (twilioWS, req) => {
         case 'media':
           counters.frames++;
           if (counters.frames % 100 === 0) console.log('WS: frames', counters.frames);
-          // Twilio payload is already μ-law base64; pass straight through to OpenAI
           if (aiWS.readyState === 1 && data.media?.payload) {
             aiWS.send(JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: data.media.payload
+              audio: data.media.payload // Twilio payload is already μ-law base64
             }));
           }
           break;
 
         case 'stop':
           console.log('WS: stream stopped (frames received:', counters.frames, ')');
-          // Do NOT commit on stop — avoids empty-buffer errors; VAD commits turns.
+          // Do NOT commit on stop — VAD commits turns for us.
           try { twilioWS.close(); } catch {}
           break;
       }
