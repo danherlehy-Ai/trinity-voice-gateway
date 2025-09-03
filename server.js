@@ -81,6 +81,28 @@ app.get('/warmup', (_req, res) => res.status(204).end());
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
+// Config source (Google Apps Script Web App)
+const CONFIG_URL =
+  process.env.GOOGLE_CONFIG_URL ||
+  'https://script.google.com/macros/s/AKfycbyznDl5tePAa-xijAgm-MaJ74II4ACWm302k_Xtm_bjlzXUAPidWedi7cK3CgAHJV5I/exec';
+
+async function fetchConfig() {
+  try {
+    const res = await fetch(CONFIG_URL, { method: 'GET' });
+    if (!res.ok) throw new Error(`Config HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json?.ok) throw new Error(`Config error: ${JSON.stringify(json)}`);
+    const system_prompt = (json.system_prompt || '').toString();
+    const vips = Array.isArray(json.vips) ? json.vips : [];
+    const businesses = Array.isArray(json.businesses) ? json.businesses : [];
+    console.log(`Config: loaded prompt (${system_prompt.length} chars), vips=${vips.length}, businesses=${businesses.length}`);
+    return { system_prompt, vips, businesses };
+  } catch (err) {
+    console.log('Config fetch failed:', err?.message);
+    return { system_prompt: 'You are Trinity.', vips: [], businesses: [] };
+  }
+}
+
 wss.on('connection', (twilioWS, req) => {
   console.log('WS: connection from', req.socket.remoteAddress);
   let streamSid = null;
@@ -94,27 +116,31 @@ wss.on('connection', (twilioWS, req) => {
   };
   const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
 
-  aiWS.on('open', () => {
+  aiWS.on('open', async () => {
     console.log('AI: connected');
     const desiredVoice = process.env.DEFAULT_VOICE || 'marin';
 
-    // *** Use μ-law both directions to avoid conversion/static ***
+    // ---- NEW: fetch prompt/VIPs/Businesses from Google Apps Script
+    const { system_prompt } = await fetchConfig();
+
+    // Configure session: voice + VAD + μ-law I/O + instructions from Sheet
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
         voice: desiredVoice,
         turn_detection: { type: 'server_vad', threshold: 0.6 },
         input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw'
+        output_audio_format: 'g711_ulaw',
+        instructions: system_prompt || 'You are Trinity.'
       }
     }));
 
-    // One-shot test line so we can confirm return audio path
+    // One-shot line so we can confirm return audio path
     aiWS.send(JSON.stringify({
       type: 'response.create',
       response: {
         modalities: ['audio', 'text'],
-        instructions: 'Say: "I am connected and listening." Then wait quietly for the caller.'
+        instructions: 'I am connected and listening.'
       }
     }));
   });
