@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
@@ -22,7 +21,7 @@ function downsample16kTo8k(int16) {
   for (let i = 0, j = 0; j < out.length; i += 2, j++) out[j] = int16[i];
   return out;
 }
-const TWILIO_ULAW_BYTES_PER_20MS = 160; // 8kHz * 0.02s * 1 byte/sample
+const TWILIO_ULAW_BYTES_PER_20MS = 160;
 function chunkAndSendUlawBase64ToTwilio(b64Ulaw, twilioWS, streamSid, counters) {
   const bytes = Buffer.from(b64Ulaw, 'base64');
   for (let off = 0; off < bytes.length; off += TWILIO_ULAW_BYTES_PER_20MS) {
@@ -91,7 +90,7 @@ async function getConfigCached() {
   }
 }
 
-// Beef up /warmup: prefetch config and warm OpenAI TLS
+// /warmup: prefetch config and warm OpenAI TLS
 app.get('/warmup', async (_req, res) => {
   try {
     await getConfigCached();
@@ -136,20 +135,15 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip, callerN
     VIP_SKIP_NUMBER,
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
-  if (callerNumber || callerName) {
-    const parts = [];
-    if (callerName) parts.push(`Name: ${callerName}`);
-    if (callerNumber) parts.push(`Number: ${normalizePhone(callerNumber)}`);
-    lines.push(`[CALL CONTEXT] Caller -> ${parts.join(', ')}.`);
-  }
-  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
-  const text = lines.filter(Boolean).join('\n');
-  return text;
+  if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
+  if (callerName)  lines.push(`[CALL CONTEXT] CallerName: ${callerName}.`);
+  if (callerVip)   lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
+  return lines.filter(Boolean).join('\n');
 }
 
 /* ================= /transcripts webhook (with GREETING FILTER) ================= */
 
-// Greeting variants to ignore in transcript
+// Edit/extend with any variants you use in <Say>
 const GREETING_PREFIXES = [
   "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
   "Hi, this is Trinity, Dan Hurley AI assistant",
@@ -162,11 +156,10 @@ function isGreeting(line) {
       || (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-// Per-call buffer & metadata store
-// transcripts.set(CallSid, { caller:[], assistant:[], raw:[], greetingSkipped:false, meta:{from,to,callerName} })
-const transcripts = new Map();
+// Per-call buffers (transcript) and metadata captured from WS start
+const transcripts = new Map(); // callSid -> { caller:[], assistant:[], raw:[], greetingSkipped:boolean }
+const callMeta    = new Map(); // callSid -> { from, to, callerName }
 
-// --- Telegram helper (no extra deps; uses Bot API directly) ---
 async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -175,10 +168,10 @@ async function sendTelegramMessage(text) {
     return;
   }
   const endpoint = `https://api.telegram.org/bot${token}/sendMessage`;
-  const MAX = 3800; // headroom under 4096
-
-  for (let i = 0; i < text.length; i += MAX) {
-    const part = text.slice(i, i + MAX);
+  const MAX = 3800;
+  const chunks = [];
+  for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
+  for (const part of chunks) {
     try {
       await fetch(endpoint, {
         method: 'POST',
@@ -202,7 +195,7 @@ app.post('/transcripts', async (req, res) => {
 
     // Ensure buffer
     if (!transcripts.has(callSid)) {
-      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: {} });
+      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false });
     }
     const buf = transcripts.get(callSid);
 
@@ -212,7 +205,6 @@ app.post('/transcripts', async (req, res) => {
     }
 
     if (ev === 'transcription-content') {
-      // Pull text
       let text = '';
       try {
         if (req.body.TranscriptionData) {
@@ -225,13 +217,12 @@ app.post('/transcripts', async (req, res) => {
       const line = (text || '').trim();
       if (!line) return res.status(200).send('ok');
 
-      // Identify speaker if possible
-      const track = (req.body.Track || req.body.track || '').toLowerCase(); // 'inbound_track' | 'outbound_track' | 'both_tracks'
+      const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track | both_tracks
 
-      // ===== GREETING FILTER: drop the first assistant line if it's the greeting =====
+      // drop the first assistant line if it's the greeting
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
         buf.greetingSkipped = true;
-        return res.status(200).send('ok'); // do not store the greeting
+        return res.status(200).send('ok');
       }
 
       if (track === 'inbound_track') buf.caller.push(line);
@@ -256,18 +247,18 @@ app.post('/transcripts', async (req, res) => {
         transcript = buf.raw.join(' ');
       }
 
-      // Metadata for headers
-      const from = buf.meta?.from || '';
-      const to = buf.meta?.to || '';
-      const callerName = buf.meta?.callerName || '';
+      const meta = callMeta.get(callSid) || {};
+      const from = meta.from || '';
+      const to   = meta.to || '';
+      const callerName = meta.callerName || '';
 
-      // POST to Google Apps Script
+      // Ship to Google Apps Script (append to Calls)
       try {
         const form = new URLSearchParams();
-        if (from) form.set('From', from);
-        if (to) form.set('To', to);
-        if (callerName) form.set('CallerName', callerName);
         form.set('CallSid', callSid);
+        if (from)       form.set('From', from);
+        if (to)         form.set('To', to);
+        if (callerName) form.set('CallerName', callerName);
         form.set('transcript', transcript || '');
         await fetch(GOOGLE_APPS_SCRIPT_URL, {
           method: 'POST',
@@ -278,20 +269,19 @@ app.post('/transcripts', async (req, res) => {
         console.log('Apps Script POST failed:', e?.message);
       }
 
-      // Telegram alert
-      const namePart = callerName ? `${callerName}` : 'Unknown';
-      const numberPart = from || 'Unknown';
-      const toPart = to || 'Unknown';
-      const header =
-        `📞 New Call\nFrom: ${namePart} ${numberPart}\nTo: ${toPart}\nCallSid: ${callSid}\n\n`;
+      // Telegram header includes name and phone (if available)
+      const nameLine = callerName ? `Name: ${callerName}\n` : '';
+      const numLine  = from ? `From: ${from}\n` : '';
+      const toLine   = to ? `To: ${to}\n` : '';
+      const header = `📞 New Call Transcript\n${nameLine}${numLine}${toLine}CallSid: ${callSid}\n\n`;
       await sendTelegramMessage(header + (transcript || '(empty)'));
 
       // Cleanup
       transcripts.delete(callSid);
+      callMeta.delete(callSid);
       return res.status(200).send('ok');
     }
 
-    // Unknown event
     return res.status(200).send('ok');
   } catch (e) {
     console.log('TRANSCRIPT handler error:', e?.message);
@@ -308,8 +298,9 @@ wss.on('connection', (twilioWS, req) => {
 
   let streamSid = null;
   let callerFrom = null;
-  let callerName = null;
   let callerVip = null;
+  let callerName = null;
+  let callerTo = null;
   let currentVoice = process.env.DEFAULT_VOICE || 'marin';
   const counters = { frames: 0, sentChunks: 0 };
 
@@ -328,7 +319,6 @@ wss.on('connection', (twilioWS, req) => {
     if (!aiReady) return;
     if (!latestConfig) latestConfig = await getConfigCached();
 
-    // Identify VIP by caller number (if provided)
     if (callerFrom && latestConfig.vips?.length) {
       const norm = normalizePhone(callerFrom);
       const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
@@ -336,13 +326,7 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-    const instructions = buildInstructions(
-      latestConfig.system_prompt,
-      latestConfig.vips,
-      callerFrom,
-      callerVip,
-      callerName
-    );
+    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip, callerName);
 
     console.log(
       `Applying session config (${reason}) -> voice=${selectedVoice}` +
@@ -367,7 +351,7 @@ wss.on('connection', (twilioWS, req) => {
     console.log('AI: connected');
     aiReady = true;
     latestConfig = await getConfigCached();
-    await applySessionConfig('on-open'); // early config push
+    await applySessionConfig('on-open');
   });
 
   aiWS.on('message', (raw, isBinary) => {
@@ -407,7 +391,7 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: connected event');
           break;
 
-        case 'start': {
+        case 'start':
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
@@ -415,30 +399,22 @@ wss.on('connection', (twilioWS, req) => {
           // Pull custom parameters from Twilio <Stream>
           try {
             const params = data.start?.customParameters || [];
-            const getParam = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || null;
-            const fromParam       = getParam('from');
-            const toParam         = getParam('to');
-            const callSidParam    = getParam('callSid');
-            const callerNameParam = getParam('callerName');
+            const get = (n) => (Array.isArray(params) ? params.find(p => p?.name === n)?.value : null);
 
-            callerFrom = fromParam;
-            callerName = callerNameParam;
+            callerFrom  = get('from') || null;
+            callerTo    = get('to') || null;
+            callerName  = get('callerName') || null;
+            const callSidParam = get('callSid') || null;
 
-            if (callerFrom) console.log('CallerID (From):', callerFrom);
-            if (callerName) console.log('Caller Name:', callerName);
+            if (callerFrom) console.log('CallerID (From) received:', callerFrom);
+            if (callerName) console.log('CallerName received:', callerName);
 
-            // Ensure transcript buffer exists and store meta for webhook use
-            if (callSidParam && !transcripts.has(callSidParam)) {
-              transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: {} });
-            }
+            // Seed callMeta for this call so /transcripts can include name/number
             if (callSidParam) {
-              const buf = transcripts.get(callSidParam);
-              buf.meta = {
-                ...(buf.meta || {}),
-                from: fromParam || buf.meta?.from,
-                to: toParam || buf.meta?.to,
-                callerName: callerNameParam || buf.meta?.callerName
-              };
+              callMeta.set(callSidParam, { from: callerFrom || '', to: callerTo || '', callerName: callerName || '' });
+              if (!transcripts.has(callSidParam)) {
+                transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+              }
             }
           } catch {}
 
@@ -448,7 +424,6 @@ wss.on('connection', (twilioWS, req) => {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
           break;
-        }
 
         case 'media':
           counters.frames++;
