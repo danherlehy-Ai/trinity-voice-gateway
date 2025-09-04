@@ -132,7 +132,7 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
   return lines.filter(Boolean).join('\n');
 }
 
-/* ====== Varied conversational openings (NEW) ====== */
+/* ====== Varied conversational openings ====== */
 const OPENING_VARIANTS = [
   'Warm, upbeat hello; concise and helpful.',
   'Friendly, professional greeting; offer assistance.',
@@ -163,12 +163,8 @@ function isGreeting(line) {
          (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-/* ================= Transcript store (now timeline events) ================= */
-// Map<CallSid, {
-//   events: Array<{ role:'assistant'|'caller', text:string, ts:number }>,
-//   greetingSkipped: boolean,
-//   meta: { from: string, to: string, callerName: string }
-// }>
+/* ============== Transcript store + idle state (timeline + meta) ============== */
+// Map<CallSid, { events: Array<{role:'assistant'|'caller', text:string, ts:number}>, greetingSkipped:boolean, meta:{from,to,callerName}, lastActivityAt:number, idleTimer:any, aiWS?:WebSocket, twilioWS?:WebSocket }>
 const transcripts = new Map();
 
 /* ================= Telegram helper ================= */
@@ -202,20 +198,14 @@ function displayNameAndNumber(name, num){
 
 /* ================= Interleaved transcript rendering ================= */
 const COALESCE_WINDOW_MS = 2000; // merge adjacent same-role chunks within 2s
-
 function buildInterleavedTranscript(events) {
   if (!Array.isArray(events) || events.length === 0) return '';
-
-  // 1) sort by timestamp
   const sorted = [...events].sort((a, b) => (a.ts || 0) - (b.ts || 0));
-
-  // 2) coalesce adjacent same-role chunks (within window)
   const merged = [];
   for (const e of sorted) {
     const role = e.role === 'assistant' ? 'Assistant' : 'Caller';
     const text = (e.text || '').trim();
     if (!text) continue;
-
     const last = merged[merged.length - 1];
     if (last && last.role === role && (e.ts - last.tsLast) <= COALESCE_WINDOW_MS) {
       last.text += (last.text.endsWith('-') ? '' : ' ') + text;
@@ -224,9 +214,81 @@ function buildInterleavedTranscript(events) {
       merged.push({ role, text, tsFirst: e.ts, tsLast: e.ts });
     }
   }
-
-  // 3) render as alternating blocks
   return merged.map(turn => `${turn.role}:\n${turn.text}`).join('\n\n');
+}
+
+/* ================= Idle hang-up settings (env) ================= */
+const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 10));
+const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowerCase() === 'true';
+const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
+
+/* ================= Idle helpers ================= */
+function getState(callSid) {
+  if (!transcripts.has(callSid)) {
+    transcripts.set(callSid, {
+      events: [],
+      greetingSkipped: false,
+      meta: { from: '', to: '', callerName: '' },
+      lastActivityAt: Date.now(),
+      idleTimer: null,
+      aiWS: undefined,
+      twilioWS: undefined
+    });
+  }
+  return transcripts.get(callSid);
+}
+function bumpActivity(callSid, reason) {
+  const s = getState(callSid);
+  s.lastActivityAt = Date.now();
+  resetIdleTimer(callSid);
+}
+function resetIdleTimer(callSid) {
+  const s = getState(callSid);
+  if (s.idleTimer) clearTimeout(s.idleTimer);
+  s.idleTimer = setTimeout(() => triggerIdle(callSid), IDLE_HANGUP_SECS * 1000);
+}
+async function triggerIdle(callSid) {
+  const s = transcripts.get(callSid);
+  if (!s) return;
+
+  console.log(`IDLE timeout for ${callSid} after ${IDLE_HANGUP_SECS}s`);
+
+  try {
+    if (IDLE_SEND_GOODBYE && s.aiWS && s.aiWS.readyState === 1) {
+      s.aiWS.send(JSON.stringify({
+        type: 'response.create',
+        response: { instructions: GOODBYE_LINE }
+      }));
+      await new Promise(r => setTimeout(r, 1500)); // let audio play
+    }
+  } catch (e) {
+    console.log('Idle goodbye send failed:', e?.message);
+  }
+
+  // Hang up via Twilio REST
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken  = process.env.TWILIO_AUTH_TOKEN;
+    if (!accountSid || !authToken) {
+      console.log('Missing TWILIO_ACCOUNT_SID/AUTH_TOKEN; cannot hang up.');
+    } else {
+      const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls/${encodeURIComponent(callSid)}.json`;
+      const form = new URLSearchParams();
+      form.set('Status', 'completed');
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString()
+      });
+      console.log('Twilio hangup HTTP:', resp.status);
+    }
+  } catch (e) {
+    console.log('Hangup REST error:', e?.message);
+  }
+
+  try { s.aiWS?.close?.(); } catch {}
+  try { s.twilioWS?.close?.(); } catch {}
 }
 
 /* ================= /transcripts webhook ================= */
@@ -236,24 +298,20 @@ app.post('/transcripts', async (req, res) => {
     const callSid = req.body.CallSid || req.body.callsid || '';
     if (!callSid) { console.log('TRANSCRIPT: missing CallSid'); return res.status(200).send('ok'); }
 
-    // Ensure buffer & meta (prefer query params if present)
-    if (!transcripts.has(callSid)) {
-      transcripts.set(callSid, { events: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
-    }
-    const buf = transcripts.get(callSid);
+    const buf = getState(callSid);
 
-    // Pick meta from query (Function attached these) or body fallbacks
+    // Meta from query/body
     const q = req.query || {};
     const fromQ = q.from || req.body.From || req.body.from || '';
     const toQ = q.to || req.body.To || req.body.to || '';
     const callerNameQ = q.callerName || req.body.CallerName || req.body.caller_name || '';
-
     if (fromQ && !buf.meta.from) buf.meta.from = fromQ;
     if (toQ && !buf.meta.to) buf.meta.to = toQ;
     if (callerNameQ && !buf.meta.callerName) buf.meta.callerName = callerNameQ;
 
     if (ev === 'transcription-started') {
       console.log('TRANSCRIPT started', callSid);
+      bumpActivity(callSid, 'start');
       return res.status(200).send('ok');
     }
 
@@ -268,38 +326,31 @@ app.post('/transcripts', async (req, res) => {
       if (!text && req.body.TranscriptionText) text = req.body.TranscriptionText;
 
       const line = (text || '').trim();
-      if (!line) return res.status(200).send('ok');
+      if (!line) { bumpActivity(callSid, 'empty'); return res.status(200).send('ok'); }
 
       const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track
 
-      // Drop first assistant greeting
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
         buf.greetingSkipped = true;
+        bumpActivity(callSid, 'greeting-skip');
         return res.status(200).send('ok');
       }
 
-      // Determine role
       let role = null;
       if (track === 'inbound_track') role = 'caller';
       else if (track === 'outbound_track') role = 'assistant';
+      if (role) buf.events.push({ role, text: line, ts: Date.now() });
+      else      buf.events.push({ role: 'caller', text: line, ts: Date.now() });
 
-      if (role) {
-        buf.events.push({ role, text: line, ts: Date.now() });
-      } else {
-        // Unknown track; append as caller by default to avoid losing content
-        buf.events.push({ role: 'caller', text: line, ts: Date.now() });
-      }
-
+      bumpActivity(callSid, 'speech');
       return res.status(200).send('ok');
     }
 
     if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       console.log('TRANSCRIPT finished', callSid, ev);
 
-      // Build interleaved transcript
       const transcript = buildInterleavedTranscript(buf.events);
 
-      // Post to Google Apps Script with meta so columns fill
       try {
         const form = new URLSearchParams();
         form.set('CallSid', callSid);
@@ -316,7 +367,6 @@ app.post('/transcripts', async (req, res) => {
         console.log('Apps Script POST failed:', e?.message);
       }
 
-      // Telegram header now includes From / To / CallerName
       const header =
         `📞 New Call\n` +
         `From: ${displayNameAndNumber(buf.meta.callerName, buf.meta.from)}\n` +
@@ -324,7 +374,7 @@ app.post('/transcripts', async (req, res) => {
         `CallSid: ${callSid}\n\n`;
       await sendTelegramMessage(header + (transcript || '(empty)'));
 
-      transcripts.delete(callSid);
+      // keep state for idle cleanup; don't delete here
       return res.status(200).send('ok');
     }
 
@@ -345,7 +395,7 @@ wss.on('connection', (twilioWS, req) => {
   let streamSid = null;
   let callerFrom = null;
   let callerVip = null;
-  let callerName = null;           // NEW: keep caller name for varied openers
+  let callerName = null;
   const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
@@ -355,6 +405,7 @@ wss.on('connection', (twilioWS, req) => {
 
   let aiReady = false;
   let latestConfig = null;
+  let currentCallSid = null;
 
   async function applySessionConfig(reason) {
     if (!aiReady) return;
@@ -369,25 +420,21 @@ wss.on('connection', (twilioWS, req) => {
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
 
-    // Compose a lightweight, varied, conversational opening AFTER Twilio's greeting.
     const opening = pickOpening();
     const nameHint = safeName({ callerVip, callerName, callerFrom });
     const vipNotes = callerVip?.persona_notes
       ? `If appropriate, you may naturally reference ONE brief, appropriate detail from VIP notes: "${String(callerVip.persona_notes)}". Do not over-share; keep it tasteful and relevant.`
       : '';
-
     const openingDirective =
       `OPENING STYLE: ${opening}\n` +
       `After the phone greeting has played, begin with a short, varied first line. ` +
       `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Keep it conversational and concise (≈1 sentence). ` +
-      `Vary your phrasing each call; avoid repeating the exact same words within a call. ` +
-      `${vipNotes}`;
+      `Vary your phrasing each call; avoid repeating the exact same words within a call. ${vipNotes}`;
 
     const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
 
     console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` +
-      (callerVip ? `, VIP=${callerVip.name}` : '') +
-      `, instr len=${finalInstructions.length}`);
+      (callerVip ? `, VIP=${callerVip.name}` : '') + `, instr len=${finalInstructions.length}`);
 
     aiWS.send(JSON.stringify({
       type: 'session.update',
@@ -410,8 +457,11 @@ wss.on('connection', (twilioWS, req) => {
 
   aiWS.on('message', (raw, isBinary) => {
     if (!streamSid) return;
+
+    // Assistant audio counts as activity (prevents idle while speaking)
     if (isBinary) {
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
+      if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
       return;
     }
     try {
@@ -421,7 +471,10 @@ wss.on('connection', (twilioWS, req) => {
       }
       if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
         const b64 = msg.delta || msg.audio;
-        if (b64) chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
+        if (b64) {
+          chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
+          if (currentCallSid) bumpActivity(currentCallSid, 'ai-delta');
+        }
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
@@ -439,7 +492,7 @@ wss.on('connection', (twilioWS, req) => {
   twilioWS.on('message', async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-    switch (data.event) {
+      switch (data.event) {
         case 'connected':
           console.log('WS: connected event');
           break;
@@ -457,18 +510,19 @@ wss.on('connection', (twilioWS, req) => {
             const callerNameParam = getP('callerName');
             const callSid = getP('callSid');
 
+            currentCallSid = callSid || currentCallSid;
             if (from) console.log('CallerID (From) received:', from);
             callerFrom = from;
-            callerName = callerNameParam || callerName;   // NEW: store name for openings
+            callerName = callerNameParam || callerName;
 
-            if (callSid) {
-              if (!transcripts.has(callSid)) {
-                transcripts.set(callSid, { events: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
-              }
-              const buf = transcripts.get(callSid);
-              if (from && !buf.meta.from) buf.meta.from = from;
-              if (to && !buf.meta.to) buf.meta.to = to;
-              if (callerNameParam && !buf.meta.callerName) buf.meta.callerName = callerNameParam;
+            if (currentCallSid) {
+              const s = getState(currentCallSid);
+              s.aiWS = aiWS;
+              s.twilioWS = twilioWS;
+              if (from && !s.meta.from) s.meta.from = from;
+              if (to && !s.meta.to) s.meta.to = to;
+              if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
+              resetIdleTimer(currentCallSid); // start idle timer
             }
           } catch {}
 
@@ -484,6 +538,7 @@ wss.on('connection', (twilioWS, req) => {
           if (counters.frames % 100 === 0) console.log('WS: frames', counters.frames);
           if (aiWS.readyState === 1 && data.media?.payload) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
+            if (currentCallSid) bumpActivity(currentCallSid, 'caller-media'); // caller noise/speech
           }
           break;
 
@@ -498,8 +553,8 @@ wss.on('connection', (twilioWS, req) => {
   });
 
   twilioWS.on('close', () => {
-    if (aiWS.readyState === 1) aiWS.close();
     console.log('WS: connection closed');
+    // Keep state briefly; /transcripts may still post logger data
   });
   twilioWS.on('error', (err) => console.log('WS: error', err?.message));
 });
