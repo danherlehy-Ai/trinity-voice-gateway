@@ -168,6 +168,35 @@ const transcripts = new Map();
   })
 */
 
+// --- Telegram helper (no extra deps; uses Bot API directly) ---
+async function sendTelegramMessage(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log('Telegram env not set; skipping send.');
+    return;
+  }
+  const endpoint = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  // Telegram text limit ~4096 chars. Send in chunks.
+  const MAX = 3800; // leave headroom
+  const chunks = [];
+  for (let i = 0; i < text.length; i += MAX) {
+    chunks.push(text.slice(i, i + MAX));
+  }
+  for (const part of chunks) {
+    try {
+      await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: part })
+      });
+    } catch (e) {
+      console.log('Telegram send failed:', e?.message);
+    }
+  }
+}
+
 app.post('/transcripts', async (req, res) => {
   try {
     const ev = req.body.TranscriptionEvent || req.body.transcriptionevent || '';
@@ -220,14 +249,15 @@ app.post('/transcripts', async (req, res) => {
 
     if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       console.log('TRANSCRIPT finished', callSid, ev);
-      // Combine
+
+      // Build a readable transcript
       let transcript = '';
       if (buf.caller.length || buf.assistant.length) {
         const caller = buf.caller.join(' ');
         const agent  = buf.assistant.join(' ');
         transcript =
-          (caller ? `Caller: ${caller}\n` : '') +
-          (agent  ? `Assistant: ${agent}\n` : '');
+          (caller ? `Caller:\n${caller}\n\n` : '') +
+          (agent  ? `Assistant:\n${agent}\n` : '');
       } else {
         transcript = buf.raw.join(' ');
       }
@@ -244,9 +274,14 @@ app.post('/transcripts', async (req, res) => {
         });
       } catch (e) {
         console.log('Apps Script POST failed:', e?.message);
-      } finally {
-        transcripts.delete(callSid);
       }
+
+      // Send to Telegram (header + body, chunked if needed)
+      const header = `📞 New Call Transcript\nCallSid: ${callSid}\n\n`;
+      await sendTelegramMessage(header + (transcript || '(empty)'));
+
+      // Always clean up buffer
+      transcripts.delete(callSid);
       return res.status(200).send('ok');
     }
 
@@ -418,3 +453,4 @@ wss.on('connection', (twilioWS, req) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
+
