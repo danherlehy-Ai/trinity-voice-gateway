@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import https from 'node:https'; // NEW: fallback for Twilio REST
 
 /* ================= μ-law helpers (fallback only) ================= */
 const SIGN_BIT = 0x80, QUANT_MASK = 0x0F, SEG_SHIFT = 4, SEG_MASK = 0x70;
@@ -222,6 +223,70 @@ const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 10))
 const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowerCase() === 'true';
 const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
 
+/* ================= Twilio hang-up helper (fetch + https fallback) ================= */
+async function hangupCall(callSid) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken  = process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !authToken) {
+    console.log('Missing TWILIO_ACCOUNT_SID/AUTH_TOKEN; cannot hang up.');
+    return false;
+  }
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+  const path = `/2010-04-01/Accounts/${accountSid}/Calls/${encodeURIComponent(callSid)}.json`;
+
+  // 1) Try fetch
+  try {
+    const url = `https://api.twilio.com${path}`;
+    const form = new URLSearchParams();
+    form.set('Status', 'completed');
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json'
+      },
+      body: form.toString()
+    });
+    const bodyText = await resp.text();
+    console.log('Twilio hangup via fetch:', resp.status, bodyText.slice(0,200));
+    return resp.ok;
+  } catch (e) {
+    console.log('Fetch to Twilio failed, falling back to https:', e?.message);
+  }
+
+  // 2) Fallback to core https
+  return await new Promise((resolve) => {
+    const postData = 'Status=completed';
+    const options = {
+      hostname: 'api.twilio.com',
+      port: 443,
+      path,
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
+        'Accept': 'application/json'
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        console.log('Twilio hangup via https:', res.statusCode, data.slice(0,200));
+        resolve(res.statusCode >= 200 && res.statusCode < 300);
+      });
+    });
+    req.on('error', (err) => {
+      console.log('HTTPS fallback error:', err?.message);
+      resolve(false);
+    });
+    req.write(postData);
+    req.end();
+  });
+}
+
 /* ================= Idle helpers ================= */
 function getState(callSid) {
   if (!transcripts.has(callSid)) {
@@ -265,27 +330,8 @@ async function triggerIdle(callSid) {
     console.log('Idle goodbye send failed:', e?.message);
   }
 
-  // Hang up via Twilio REST
-  try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken  = process.env.TWILIO_AUTH_TOKEN;
-    if (!accountSid || !authToken) {
-      console.log('Missing TWILIO_ACCOUNT_SID/AUTH_TOKEN; cannot hang up.');
-    } else {
-      const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls/${encodeURIComponent(callSid)}.json`;
-      const form = new URLSearchParams();
-      form.set('Status', 'completed');
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: form.toString()
-      });
-      console.log('Twilio hangup HTTP:', resp.status);
-    }
-  } catch (e) {
-    console.log('Hangup REST error:', e?.message);
-  }
+  const ok = await hangupCall(callSid);
+  if (!ok) console.log('Hangup REST still failed; sockets will close when Twilio ends the call.');
 
   try { s.aiWS?.close?.(); } catch {}
   try { s.twilioWS?.close?.(); } catch {}
@@ -360,204 +406,4 @@ app.post('/transcripts', async (req, res) => {
         form.set('transcript', transcript || '');
         await fetch(GOOGLE_APPS_SCRIPT_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: form.toString()
-        });
-      } catch (e) {
-        console.log('Apps Script POST failed:', e?.message);
-      }
-
-      const header =
-        `📞 New Call\n` +
-        `From: ${displayNameAndNumber(buf.meta.callerName, buf.meta.from)}\n` +
-        `To: ${buf.meta.to || 'Unknown'}\n` +
-        `CallSid: ${callSid}\n\n`;
-      await sendTelegramMessage(header + (transcript || '(empty)'));
-
-      // keep state for idle cleanup; don't delete here
-      return res.status(200).send('ok');
-    }
-
-    return res.status(200).send('ok');
-  } catch (e) {
-    console.log('TRANSCRIPT handler error:', e?.message);
-    return res.status(200).send('ok');
-  }
-});
-
-/* ================= WebSocket bridge ================= */
-const server = createServer(app);
-const wss = new WebSocketServer({ server, path: '/media' });
-
-wss.on('connection', (twilioWS, req) => {
-  console.log('WS: connection from', req.socket.remoteAddress);
-
-  let streamSid = null;
-  let callerFrom = null;
-  let callerVip = null;
-  let callerName = null;
-  const counters = { frames: 0, sentChunks: 0 };
-
-  const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
-  const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
-  const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
-
-  let aiReady = false;
-  let latestConfig = null;
-  let currentCallSid = null;
-
-  async function applySessionConfig(reason) {
-    if (!aiReady) return;
-    if (!latestConfig) latestConfig = await getConfigCached();
-
-    if (callerFrom && latestConfig.vips?.length) {
-      const norm = normalizePhone(callerFrom);
-      const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
-      if (found) callerVip = found;
-    }
-
-    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-    const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
-
-    const opening = pickOpening();
-    const nameHint = safeName({ callerVip, callerName, callerFrom });
-    const vipNotes = callerVip?.persona_notes
-      ? `If appropriate, you may naturally reference ONE brief, appropriate detail from VIP notes: "${String(callerVip.persona_notes)}". Do not over-share; keep it tasteful and relevant.`
-      : '';
-    const openingDirective =
-      `OPENING STYLE: ${opening}\n` +
-      `After the phone greeting has played, begin with a short, varied first line. ` +
-      `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Keep it conversational and concise (≈1 sentence). ` +
-      `Vary your phrasing each call; avoid repeating the exact same words within a call. ${vipNotes}`;
-
-    const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
-
-    console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` +
-      (callerVip ? `, VIP=${callerVip.name}` : '') + `, instr len=${finalInstructions.length}`);
-
-    aiWS.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        voice: selectedVoice,
-        turn_detection: { type: 'server_vad', threshold: 0.6 },
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        instructions: finalInstructions
-      }
-    }));
-  }
-
-  aiWS.on('open', async () => {
-    console.log('AI: connected');
-    aiReady = true;
-    latestConfig = await getConfigCached();
-    await applySessionConfig('on-open');
-  });
-
-  aiWS.on('message', (raw, isBinary) => {
-    if (!streamSid) return;
-
-    // Assistant audio counts as activity (prevents idle while speaking)
-    if (isBinary) {
-      sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
-      if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
-      return;
-    }
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (!['response.audio.delta', 'response.output_audio.delta'].includes(msg?.type)) {
-        console.log('AI event:', msg?.type);
-      }
-      if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
-        const b64 = msg.delta || msg.audio;
-        if (b64) {
-          chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
-          if (currentCallSid) bumpActivity(currentCallSid, 'ai-delta');
-        }
-      } else if (msg.type === 'error') {
-        console.log('AI error:', msg.error || msg);
-      }
-    } catch (e) {
-      console.log('AI: failed to parse message', e?.message);
-    }
-  });
-
-  aiWS.on('close', () => {
-    console.log('AI: closed');
-    console.log(`Session summary: received ${counters.frames} frames, sent ${counters.sentChunks} audio chunks`);
-  });
-  aiWS.on('error', (err) => console.log('AI: error', err?.message));
-
-  twilioWS.on('message', async (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      switch (data.event) {
-        case 'connected':
-          console.log('WS: connected event');
-          break;
-
-        case 'start':
-          streamSid = data.start?.streamSid;
-          console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
-          counters.frames = 0; counters.sentChunks = 0;
-
-          try {
-            const params = data.start?.customParameters || [];
-            const getP = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || '';
-            const from  = getP('from');
-            const to    = getP('to');
-            const callerNameParam = getP('callerName');
-            const callSid = getP('callSid');
-
-            currentCallSid = callSid || currentCallSid;
-            if (from) console.log('CallerID (From) received:', from);
-            callerFrom = from;
-            callerName = callerNameParam || callerName;
-
-            if (currentCallSid) {
-              const s = getState(currentCallSid);
-              s.aiWS = aiWS;
-              s.twilioWS = twilioWS;
-              if (from && !s.meta.from) s.meta.from = from;
-              if (to && !s.meta.to) s.meta.to = to;
-              if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
-              resetIdleTimer(currentCallSid); // start idle timer
-            }
-          } catch {}
-
-          await applySessionConfig('on-start');
-
-          if (aiWS.readyState === 1) {
-            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
-          }
-          break;
-
-        case 'media':
-          counters.frames++;
-          if (counters.frames % 100 === 0) console.log('WS: frames', counters.frames);
-          if (aiWS.readyState === 1 && data.media?.payload) {
-            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
-            if (currentCallSid) bumpActivity(currentCallSid, 'caller-media'); // caller noise/speech
-          }
-          break;
-
-        case 'stop':
-          console.log('WS: stream stopped (frames received:', counters.frames, ')');
-          try { twilioWS.close(); } catch {}
-          break;
-      }
-    } catch (e) {
-      console.log('WS: failed to parse message', e?.message);
-    }
-  });
-
-  twilioWS.on('close', () => {
-    console.log('WS: connection closed');
-    // Keep state briefly; /transcripts may still post logger data
-  });
-  twilioWS.on('error', (err) => console.log('WS: error', err?.message));
-});
-
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
+          headers: { 'Content-Type': 'application/x-ww
