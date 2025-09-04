@@ -133,4 +133,288 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
   const lines = [
     system_prompt || 'You are Trinity.',
     ENGLISH_GUARD,
-    VIP_SKIP_NUMBE
+    VIP_SKIP_NUMBER,
+    vipMap ? `VIP numbers: ${vipMap}.` : ''
+  ];
+  if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
+  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
+  const text = lines.filter(Boolean).join('\n');
+  return text;
+}
+
+/* ================= /transcripts webhook (with GREETING FILTER) ================= */
+
+// Edit/extend with any variants you use in <Say>
+const GREETING_PREFIXES = [
+  "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
+  "Hi, this is Trinity, Dan Hurley AI assistant",
+  "Hi, this is Trinity, Dan Herlihy AI assistant",
+  "Hi this is Trinity, Dan Herlihy",
+];
+function isGreeting(line) {
+  const lower = (line || '').toLowerCase();
+  return GREETING_PREFIXES.some(p => lower.startsWith(p.toLowerCase()))
+      || (lower.includes('this is trinity') && lower.includes('assistant'));
+}
+
+// In-memory transcript buffers keyed by CallSid
+const transcripts = new Map();
+/*
+  transcripts.set(callSid, {
+    caller: [],
+    assistant: [],
+    raw: [],
+    greetingSkipped: false
+  })
+*/
+
+app.post('/transcripts', async (req, res) => {
+  try {
+    const ev = req.body.TranscriptionEvent || req.body.transcriptionevent || '';
+    const callSid = req.body.CallSid || req.body.callsid || '';
+    if (!callSid) {
+      console.log('TRANSCRIPT: missing CallSid');
+      return res.status(200).send('ok');
+    }
+
+    // Ensure buffer
+    if (!transcripts.has(callSid)) {
+      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+    }
+    const buf = transcripts.get(callSid);
+
+    if (ev === 'transcription-started') {
+      console.log('TRANSCRIPT started', callSid);
+      return res.status(200).send('ok');
+    }
+
+    if (ev === 'transcription-content') {
+      // Pull text
+      let text = '';
+      try {
+        if (req.body.TranscriptionData) {
+          const d = JSON.parse(req.body.TranscriptionData);
+          text = d?.transcript || d?.text || '';
+        }
+      } catch (_) {}
+      if (!text && req.body.TranscriptionText) text = req.body.TranscriptionText;
+
+      const line = (text || '').trim();
+      if (!line) return res.status(200).send('ok');
+
+      // Identify speaker if possible
+      const track = (req.body.Track || req.body.track || '').toLowerCase(); // 'inbound_track' | 'outbound_track' | 'both_tracks'
+
+      // ===== GREETING FILTER: drop the first assistant line if it's the greeting =====
+      if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
+        buf.greetingSkipped = true;
+        return res.status(200).send('ok'); // do not store the greeting
+      }
+
+      if (track === 'inbound_track') buf.caller.push(line);
+      else if (track === 'outbound_track') buf.assistant.push(line);
+      else buf.raw.push(line);
+
+      return res.status(200).send('ok');
+    }
+
+    if (ev === 'transcription-stopped' || ev === 'transcription-error') {
+      console.log('TRANSCRIPT finished', callSid, ev);
+      // Combine
+      let transcript = '';
+      if (buf.caller.length || buf.assistant.length) {
+        const caller = buf.caller.join(' ');
+        const agent  = buf.assistant.join(' ');
+        transcript =
+          (caller ? `Caller: ${caller}\n` : '') +
+          (agent  ? `Assistant: ${agent}\n` : '');
+      } else {
+        transcript = buf.raw.join(' ');
+      }
+
+      // Ship to Google Apps Script (append to Calls)
+      try {
+        const form = new URLSearchParams();
+        form.set('CallSid', callSid);
+        form.set('transcript', transcript || '');
+        await fetch(GOOGLE_APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString()
+        });
+      } catch (e) {
+        console.log('Apps Script POST failed:', e?.message);
+      } finally {
+        transcripts.delete(callSid);
+      }
+      return res.status(200).send('ok');
+    }
+
+    // Unknown event
+    return res.status(200).send('ok');
+  } catch (e) {
+    console.log('TRANSCRIPT handler error:', e?.message);
+    return res.status(200).send('ok');
+  }
+});
+
+/* ================= HTTP server + /media WebSocket ================= */
+const server = createServer(app);
+const wss = new WebSocketServer({ server, path: '/media' });
+
+wss.on('connection', (twilioWS, req) => {
+  console.log('WS: connection from', req.socket.remoteAddress);
+
+  let streamSid = null;
+  let callerFrom = null;
+  let callerVip = null;
+  let currentVoice = process.env.DEFAULT_VOICE || 'marin';
+  const counters = { frames: 0, sentChunks: 0 };
+
+  const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+  const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+  const headers = {
+    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    'OpenAI-Beta': 'realtime=v1',
+  };
+  const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
+
+  let aiReady = false;
+  let latestConfig = null;
+
+  async function applySessionConfig(reason) {
+    if (!aiReady) return;
+    if (!latestConfig) latestConfig = await getConfigCached();
+
+    // Identify VIP by caller number (if provided via Twilio <Parameter>)
+    if (callerFrom && latestConfig.vips?.length) {
+      const norm = normalizePhone(callerFrom);
+      const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
+      if (found) callerVip = found;
+    }
+
+    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
+    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
+
+    console.log(
+      `Applying session config (${reason}) -> voice=${selectedVoice}` +
+      (callerVip ? `, VIP=${callerVip.name}` : '') +
+      `, instructions length: ${instructions.length}`
+    );
+
+    currentVoice = selectedVoice;
+    aiWS.send(JSON.stringify({
+      type: 'session.update',
+      session: {
+        voice: selectedVoice,
+        turn_detection: { type: 'server_vad', threshold: 0.6 },
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        instructions
+      }
+    }));
+  }
+
+  aiWS.on('open', async () => {
+    console.log('AI: connected');
+    aiReady = true;
+    latestConfig = await getConfigCached();
+    await applySessionConfig('on-open'); // early config push
+  });
+
+  aiWS.on('message', (raw, isBinary) => {
+    if (!streamSid) return;
+
+    if (isBinary) {
+      sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
+      return;
+    }
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (!['response.audio.delta', 'response.output_audio.delta'].includes(msg?.type)) {
+        console.log('AI event:', msg?.type);
+      }
+      if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
+        const b64 = msg.delta || msg.audio;
+        if (b64) chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
+      } else if (msg.type === 'error') {
+        console.log('AI error:', msg.error || msg);
+      }
+    } catch (e) {
+      console.log('AI: failed to parse message', e?.message);
+    }
+  });
+
+  aiWS.on('close', () => {
+    console.log('AI: closed');
+    console.log(`Session summary: received ${counters.frames} frames, sent ${counters.sentChunks} audio chunks`);
+  });
+  aiWS.on('error', (err) => console.log('AI: error', err?.message));
+
+  twilioWS.on('message', async (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      switch (data.event) {
+        case 'connected':
+          console.log('WS: connected event');
+          break;
+
+        case 'start':
+          streamSid = data.start?.streamSid;
+          console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
+          counters.frames = 0; counters.sentChunks = 0;
+
+          // Pull caller number from Twilio <Parameter name="from" ... />
+          try {
+            const params = data.start?.customParameters || [];
+            const fromParam = Array.isArray(params) ? params.find(p => p?.name === 'from') : null;
+            const callParam = Array.isArray(params) ? params.find(p => p?.name === 'callSid') : null;
+            const callSidParam = callParam?.value || null;
+            const from = fromParam?.value || null;
+
+            if (from) console.log('CallerID (From) received:', from);
+            if (callSidParam && !transcripts.has(callSidParam)) {
+              transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+            }
+            if (from && callSidParam) {
+              // Optional header; not included in final Caller/Assistant output
+              const buf = transcripts.get(callSidParam);
+              if (buf) buf.raw.push(`CallerID: ${from}`);
+            }
+            callerFrom = from;
+          } catch {}
+
+          await applySessionConfig('on-start');
+
+          if (aiWS.readyState === 1) {
+            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+          }
+          break;
+
+        case 'media':
+          counters.frames++;
+          if (counters.frames % 100 === 0) console.log('WS: frames', counters.frames);
+          if (aiWS.readyState === 1 && data.media?.payload) {
+            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
+          }
+          break;
+
+        case 'stop':
+          console.log('WS: stream stopped (frames received:', counters.frames, ')');
+          try { twilioWS.close(); } catch {}
+          break;
+      }
+    } catch (e) {
+      console.log('WS: failed to parse message', e?.message);
+    }
+  });
+
+  twilioWS.on('close', () => {
+    if (aiWS.readyState === 1) aiWS.close();
+    console.log('WS: connection closed');
+  });
+  twilioWS.on('error', (err) => console.log('WS: error', err?.message));
+});
+
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
