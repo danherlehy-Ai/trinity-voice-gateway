@@ -469,4 +469,3 @@ wss.on('connection', (twilioWS, req) => {
 const PORT = process.env.PORT || 10000;
 const server = createServer(app);
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
-
