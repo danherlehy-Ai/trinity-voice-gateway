@@ -318,7 +318,7 @@ app.post('/transcripts', async (req, res) => {
 });
 
 /* ================= WebSocket bridge ================= */
-const server = createServer(app);
+const server = createServer(app);                // ← declared once here
 const wss = new WebSocketServer({ server, path: '/media' });
 
 wss.on('connection', (twilioWS, req) => {
@@ -467,5 +467,4 @@ wss.on('connection', (twilioWS, req) => {
 });
 
 const PORT = process.env.PORT || 10000;
-const server = createServer(app);
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
