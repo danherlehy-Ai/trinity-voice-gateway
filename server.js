@@ -132,6 +132,24 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
   return lines.filter(Boolean).join('\n');
 }
 
+/* ====== Varied conversational openings (NEW) ====== */
+const OPENING_VARIANTS = [
+  'Warm, upbeat hello; concise and helpful.',
+  'Friendly, professional greeting; offer assistance.',
+  'Conversational opener; one short clause of small talk.',
+  'Confident and to the point; ready to help.',
+  'Cheerful but calm; acknowledge returning callers if recognized.'
+];
+function pickOpening() {
+  return OPENING_VARIANTS[Math.floor(Math.random() * OPENING_VARIANTS.length)];
+}
+function safeName({ callerVip, callerName, callerFrom }) {
+  if (callerVip?.name) return callerVip.name;
+  if (callerName && String(callerName).trim()) return String(callerName).trim();
+  if (callerFrom && String(callerFrom).trim()) return String(callerFrom).trim();
+  return 'there';
+}
+
 /* ================= Greeting filter ================= */
 const GREETING_PREFIXES = [
   "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
@@ -318,7 +336,7 @@ app.post('/transcripts', async (req, res) => {
 });
 
 /* ================= WebSocket bridge ================= */
-const server = createServer(app);                // ← declared once here
+const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
 wss.on('connection', (twilioWS, req) => {
@@ -327,6 +345,7 @@ wss.on('connection', (twilioWS, req) => {
   let streamSid = null;
   let callerFrom = null;
   let callerVip = null;
+  let callerName = null;           // NEW: keep caller name for varied openers
   const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
@@ -348,9 +367,27 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
+    const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
 
-    console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` + (callerVip ? `, VIP=${callerVip.name}` : '') + `, instructions length: ${instructions.length}`);
+    // Compose a lightweight, varied, conversational opening AFTER Twilio's greeting.
+    const opening = pickOpening();
+    const nameHint = safeName({ callerVip, callerName, callerFrom });
+    const vipNotes = callerVip?.persona_notes
+      ? `If appropriate, you may naturally reference ONE brief, appropriate detail from VIP notes: "${String(callerVip.persona_notes)}". Do not over-share; keep it tasteful and relevant.`
+      : '';
+
+    const openingDirective =
+      `OPENING STYLE: ${opening}\n` +
+      `After the phone greeting has played, begin with a short, varied first line. ` +
+      `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Keep it conversational and concise (≈1 sentence). ` +
+      `Vary your phrasing each call; avoid repeating the exact same words within a call. ` +
+      `${vipNotes}`;
+
+    const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
+
+    console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` +
+      (callerVip ? `, VIP=${callerVip.name}` : '') +
+      `, instr len=${finalInstructions.length}`);
 
     aiWS.send(JSON.stringify({
       type: 'session.update',
@@ -359,7 +396,7 @@ wss.on('connection', (twilioWS, req) => {
         turn_detection: { type: 'server_vad', threshold: 0.6 },
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        instructions
+        instructions: finalInstructions
       }
     }));
   }
@@ -402,7 +439,7 @@ wss.on('connection', (twilioWS, req) => {
   twilioWS.on('message', async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-      switch (data.event) {
+    switch (data.event) {
         case 'connected':
           console.log('WS: connected event');
           break;
@@ -417,11 +454,12 @@ wss.on('connection', (twilioWS, req) => {
             const getP = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || '';
             const from  = getP('from');
             const to    = getP('to');
-            const callerName = getP('callerName');
+            const callerNameParam = getP('callerName');
             const callSid = getP('callSid');
 
             if (from) console.log('CallerID (From) received:', from);
             callerFrom = from;
+            callerName = callerNameParam || callerName;   // NEW: store name for openings
 
             if (callSid) {
               if (!transcripts.has(callSid)) {
@@ -430,7 +468,7 @@ wss.on('connection', (twilioWS, req) => {
               const buf = transcripts.get(callSid);
               if (from && !buf.meta.from) buf.meta.from = from;
               if (to && !buf.meta.to) buf.meta.to = to;
-              if (callerName && !buf.meta.callerName) buf.meta.callerName = callerName;
+              if (callerNameParam && !buf.meta.callerName) buf.meta.callerName = callerNameParam;
             }
           } catch {}
 
