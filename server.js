@@ -47,7 +47,6 @@ function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters
 
 /* ================= App & config ================= */
 const app = express();
-// Accept Twilio form posts AND JSON
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 app.use(express.json({ limit: '5mb' }));
 
@@ -62,7 +61,6 @@ const CONFIG_URL =
   process.env.GOOGLE_CONFIG_URL ||
   'https://script.google.com/macros/s/AKfycbxAIANRmjl_FIzeEsbC5UNT64IBYK1ITGalpGH7zKRcDw_9dDViL27ld8fir_lYrTPp/exec';
 
-// small in-memory cache to remove per-call latency
 let _configCache = { when: 0, data: null };
 const CONFIG_TTL_MS = 5 * 60 * 1000;
 
@@ -90,7 +88,6 @@ async function getConfigCached() {
   }
 }
 
-// /warmup: prefetch config and warm OpenAI TLS
 app.get('/warmup', async (_req, res) => {
   try {
     await getConfigCached();
@@ -112,8 +109,7 @@ const VIP_SKIP_NUMBER =
   'If the caller’s phone number matches a VIP number listed below, do NOT ask them to confirm their callback number; ' +
   'assume the caller ID is correct unless they provide a different number.';
 
-function normalizePhone(p) { return (p || '').replace(/\D/g, ''); }
-
+function normalizePhone(p){ return (p || '').replace(/\D/g, ''); }
 function chooseVoice(defaultVoice, vip) {
   const male = process.env.MALE_VOICE || 'alloy';
   const female = defaultVoice || 'marin';
@@ -123,12 +119,8 @@ function chooseVoice(defaultVoice, vip) {
   if (v === 'marin' || v === 'female') return female;
   return female;
 }
-
-function buildInstructions(system_prompt, vips, callerNumber, callerVip, callerName) {
-  const vipMap = vips
-    .filter(v => v.phone)
-    .map(v => `${normalizePhone(v.phone)}=${v.name}`)
-    .join(', ');
+function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
+  const vipMap = vips.filter(v => v.phone).map(v => `${normalizePhone(v.phone)}=${v.name}`).join(', ');
   const lines = [
     system_prompt || 'You are Trinity.',
     ENGLISH_GUARD,
@@ -136,14 +128,11 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip, callerN
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
   if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
-  if (callerName)  lines.push(`[CALL CONTEXT] CallerName: ${callerName}.`);
-  if (callerVip)   lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
+  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
   return lines.filter(Boolean).join('\n');
 }
 
-/* ================= /transcripts webhook (with GREETING FILTER) ================= */
-
-// Edit/extend with any variants you use in <Say>
+/* ================= Greeting filter ================= */
 const GREETING_PREFIXES = [
   "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
   "Hi, this is Trinity, Dan Hurley AI assistant",
@@ -152,26 +141,27 @@ const GREETING_PREFIXES = [
 ];
 function isGreeting(line) {
   const lower = (line || '').toLowerCase();
-  return GREETING_PREFIXES.some(p => lower.startsWith(p.toLowerCase()))
-      || (lower.includes('this is trinity') && lower.includes('assistant'));
+  return GREETING_PREFIXES.some(p => lower.startsWith(p.toLowerCase())) ||
+         (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-// Per-call buffers (transcript) and metadata captured from WS start
-const transcripts = new Map(); // callSid -> { caller:[], assistant:[], raw:[], greetingSkipped:boolean }
-const callMeta    = new Map(); // callSid -> { from, to, callerName }
+/* ================= Transcript store (now also holds meta) ================= */
+const transcripts = new Map();
+// transcripts.set(callSid, {
+//   caller: [], assistant: [], raw: [],
+//   greetingSkipped: false,
+//   meta: { from: '', to: '', callerName: '' }
+// });
 
+/* ================= Telegram helper ================= */
 async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) {
-    console.log('Telegram env not set; skipping send.');
-    return;
-  }
+  if (!token || !chatId) { console.log('Telegram env not set; skipping send.'); return; }
   const endpoint = `https://api.telegram.org/bot${token}/sendMessage`;
   const MAX = 3800;
-  const chunks = [];
-  for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
-  for (const part of chunks) {
+  for (let i = 0; i < text.length; i += MAX) {
+    const part = text.slice(i, i + MAX);
     try {
       await fetch(endpoint, {
         method: 'POST',
@@ -183,21 +173,37 @@ async function sendTelegramMessage(text) {
     }
   }
 }
+function displayNameAndNumber(name, num){
+  const n = (name || '').trim();
+  const p = (num || '').trim();
+  if (n && p) return `${n} (${p})`;
+  if (n) return n;
+  if (p) return p;
+  return 'Unknown';
+}
 
+/* ================= /transcripts webhook ================= */
 app.post('/transcripts', async (req, res) => {
   try {
     const ev = req.body.TranscriptionEvent || req.body.transcriptionevent || '';
     const callSid = req.body.CallSid || req.body.callsid || '';
-    if (!callSid) {
-      console.log('TRANSCRIPT: missing CallSid');
-      return res.status(200).send('ok');
-    }
+    if (!callSid) { console.log('TRANSCRIPT: missing CallSid'); return res.status(200).send('ok'); }
 
-    // Ensure buffer
+    // Ensure buffer & meta (prefer query params if present)
     if (!transcripts.has(callSid)) {
-      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
     }
     const buf = transcripts.get(callSid);
+
+    // Pick meta from query (Function attached these) or body fallbacks
+    const q = req.query || {};
+    const fromQ = q.from || req.body.From || req.body.from || '';
+    const toQ = q.to || req.body.To || req.body.to || '';
+    const callerNameQ = q.callerName || req.body.CallerName || req.body.caller_name || '';
+
+    if (fromQ && !buf.meta.from) buf.meta.from = fromQ;
+    if (toQ && !buf.meta.to) buf.meta.to = toQ;
+    if (callerNameQ && !buf.meta.callerName) buf.meta.callerName = callerNameQ;
 
     if (ev === 'transcription-started') {
       console.log('TRANSCRIPT started', callSid);
@@ -217,9 +223,9 @@ app.post('/transcripts', async (req, res) => {
       const line = (text || '').trim();
       if (!line) return res.status(200).send('ok');
 
-      const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track | both_tracks
+      const track = (req.body.Track || req.body.track || '').toLowerCase();
 
-      // drop the first assistant line if it's the greeting
+      // Drop first assistant greeting
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
         buf.greetingSkipped = true;
         return res.status(200).send('ok');
@@ -235,7 +241,7 @@ app.post('/transcripts', async (req, res) => {
     if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       console.log('TRANSCRIPT finished', callSid, ev);
 
-      // Build readable transcript
+      // Build transcript text
       let transcript = '';
       if (buf.caller.length || buf.assistant.length) {
         const caller = buf.caller.join(' ');
@@ -247,18 +253,13 @@ app.post('/transcripts', async (req, res) => {
         transcript = buf.raw.join(' ');
       }
 
-      const meta = callMeta.get(callSid) || {};
-      const from = meta.from || '';
-      const to   = meta.to || '';
-      const callerName = meta.callerName || '';
-
-      // Ship to Google Apps Script (append to Calls)
+      // Post to Google Apps Script with meta so columns fill
       try {
         const form = new URLSearchParams();
         form.set('CallSid', callSid);
-        if (from)       form.set('From', from);
-        if (to)         form.set('To', to);
-        if (callerName) form.set('CallerName', callerName);
+        form.set('From', buf.meta.from || '');
+        form.set('To', buf.meta.to || '');
+        form.set('CallerName', buf.meta.callerName || '');
         form.set('transcript', transcript || '');
         await fetch(GOOGLE_APPS_SCRIPT_URL, {
           method: 'POST',
@@ -269,16 +270,15 @@ app.post('/transcripts', async (req, res) => {
         console.log('Apps Script POST failed:', e?.message);
       }
 
-      // Telegram header includes name and phone (if available)
-      const nameLine = callerName ? `Name: ${callerName}\n` : '';
-      const numLine  = from ? `From: ${from}\n` : '';
-      const toLine   = to ? `To: ${to}\n` : '';
-      const header = `📞 New Call Transcript\n${nameLine}${numLine}${toLine}CallSid: ${callSid}\n\n`;
+      // Telegram header now includes From / To / CallerName
+      const header =
+        `📞 New Call\n` +
+        `From: ${displayNameAndNumber(buf.meta.callerName, buf.meta.from)}\n` +
+        `To: ${buf.meta.to || 'Unknown'}\n` +
+        `CallSid: ${callSid}\n\n`;
       await sendTelegramMessage(header + (transcript || '(empty)'));
 
-      // Cleanup
       transcripts.delete(callSid);
-      callMeta.delete(callSid);
       return res.status(200).send('ok');
     }
 
@@ -289,7 +289,7 @@ app.post('/transcripts', async (req, res) => {
   }
 });
 
-/* ================= HTTP server + /media WebSocket ================= */
+/* ================= WebSocket bridge ================= */
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
 
@@ -299,17 +299,11 @@ wss.on('connection', (twilioWS, req) => {
   let streamSid = null;
   let callerFrom = null;
   let callerVip = null;
-  let callerName = null;
-  let callerTo = null;
-  let currentVoice = process.env.DEFAULT_VOICE || 'marin';
   const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-  const headers = {
-    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    'OpenAI-Beta': 'realtime=v1',
-  };
+  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
   const aiWS = new WebSocket(OPENAI_URL, { headers, perMessageDeflate: false });
 
   let aiReady = false;
@@ -326,15 +320,10 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip, callerName);
+    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
 
-    console.log(
-      `Applying session config (${reason}) -> voice=${selectedVoice}` +
-      (callerVip ? `, VIP=${callerVip.name}` : '') +
-      `, instructions length: ${instructions.length}`
-    );
+    console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` + (callerVip ? `, VIP=${callerVip.name}` : '') + `, instructions length: ${instructions.length}`);
 
-    currentVoice = selectedVoice;
     aiWS.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -356,7 +345,6 @@ wss.on('connection', (twilioWS, req) => {
 
   aiWS.on('message', (raw, isBinary) => {
     if (!streamSid) return;
-
     if (isBinary) {
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
       return;
@@ -396,25 +384,25 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
 
-          // Pull custom parameters from Twilio <Stream>
           try {
             const params = data.start?.customParameters || [];
-            const get = (n) => (Array.isArray(params) ? params.find(p => p?.name === n)?.value : null);
+            const getP = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || '';
+            const from  = getP('from');
+            const to    = getP('to');
+            const callerName = getP('callerName');
+            const callSid = getP('callSid');
 
-            callerFrom  = get('from') || null;
-            callerTo    = get('to') || null;
-            callerName  = get('callerName') || null;
-            const callSidParam = get('callSid') || null;
+            if (from) console.log('CallerID (From) received:', from);
+            callerFrom = from;
 
-            if (callerFrom) console.log('CallerID (From) received:', callerFrom);
-            if (callerName) console.log('CallerName received:', callerName);
-
-            // Seed callMeta for this call so /transcripts can include name/number
-            if (callSidParam) {
-              callMeta.set(callSidParam, { from: callerFrom || '', to: callerTo || '', callerName: callerName || '' });
-              if (!transcripts.has(callSidParam)) {
-                transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+            if (callSid) {
+              if (!transcripts.has(callSid)) {
+                transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
               }
+              const buf = transcripts.get(callSid);
+              if (from && !buf.meta.from) buf.meta.from = from;
+              if (to && !buf.meta.to) buf.meta.to = to;
+              if (callerName && !buf.meta.callerName) buf.meta.callerName = callerName;
             }
           } catch {}
 
