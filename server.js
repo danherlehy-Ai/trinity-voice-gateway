@@ -47,13 +47,20 @@ function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters
 
 /* ================= App & config ================= */
 const app = express();
+// Accept Twilio form posts AND JSON
+app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 app.use(express.json({ limit: '5mb' }));
+
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
+const GOOGLE_APPS_SCRIPT_URL =
+  process.env.GOOGLE_APPS_SCRIPT_URL ||
+  // Keep equal to your Apps Script deployment /exec (used for logging)
+  'https://script.google.com/macros/s/AKfycbxAIANRmjl_FIzeEsbC5UNT64IBYK1ITGalpGH7zKRcDw_9dDViL27ld8fir_lYrTPp/exec';
+
 const CONFIG_URL =
   process.env.GOOGLE_CONFIG_URL ||
-  // ✅ keep this equal to your latest Apps Script deployment /exec
   'https://script.google.com/macros/s/AKfycbxAIANRmjl_FIzeEsbC5UNT64IBYK1ITGalpGH7zKRcDw_9dDViL27ld8fir_lYrTPp/exec';
 
 // small in-memory cache to remove per-call latency
@@ -80,7 +87,6 @@ async function getConfigCached() {
     return data;
   } catch (e) {
     console.log('Config fetch failed:', e?.message);
-    // fall back to last good or minimal defaults
     return _configCache.data || { system_prompt: 'You are Trinity.', vips: [], businesses: [] };
   }
 }
@@ -110,7 +116,6 @@ const VIP_SKIP_NUMBER =
 function normalizePhone(p) { return (p || '').replace(/\D/g, ''); }
 
 function chooseVoice(defaultVoice, vip) {
-  // default female: 'marin'; choose a male voice if vip.voice_override === 'male'
   const male = process.env.MALE_VOICE || 'alloy';
   const female = defaultVoice || 'marin';
   if (!vip) return female;
@@ -136,6 +141,103 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
   const text = lines.filter(Boolean).join('\n');
   return text;
 }
+
+/* ================= /transcripts webhook (NEW) ================= */
+// In-memory transcript buffers keyed by CallSid
+const transcripts = new Map();
+
+/**
+ * Twilio POSTs these events to statusCallbackUrl:
+ *  - TranscriptionEvent = transcription-started | transcription-content | transcription-stopped | transcription-error
+ *  - TranscriptionData  = JSON string for content events: {"transcript":"...", "confidence":0.99, "is_final":true}
+ *  - Track / inboundTrackLabel / outboundTrackLabel identify who is speaking
+ * We buffer per CallSid and send the final transcript to Google Apps Script on "transcription-stopped".
+ */
+app.post('/transcripts', async (req, res) => {
+  try {
+    const ev = req.body.TranscriptionEvent || req.body.transcriptionevent || '';
+    const callSid = req.body.CallSid || req.body.callsid || '';
+    if (!callSid) {
+      console.log('TRANSCRIPT: missing CallSid');
+      return res.status(200).send('ok');
+    }
+
+    // Ensure buffer
+    if (!transcripts.has(callSid)) {
+      transcripts.set(callSid, { caller: [], assistant: [], raw: [] });
+    }
+    const buf = transcripts.get(callSid);
+
+    if (ev === 'transcription-started') {
+      console.log('TRANSCRIPT started', callSid);
+      return res.status(200).send('ok');
+    }
+
+    if (ev === 'transcription-content') {
+      // Pull text
+      let text = '';
+      try {
+        if (req.body.TranscriptionData) {
+          const d = JSON.parse(req.body.TranscriptionData);
+          text = d?.transcript || d?.text || '';
+        }
+      } catch (_) {}
+      if (!text && req.body.TranscriptionText) text = req.body.TranscriptionText;
+
+      // Identify speaker if possible
+      const track = (req.body.Track || req.body.track || '').toLowerCase(); // 'inbound_track' | 'outbound_track' | 'both_tracks'
+      const inLabel = req.body.InboundTrackLabel || req.body.inboundtracklabel || '';
+      const outLabel = req.body.OutboundTrackLabel || req.body.outboundtracklabel || '';
+
+      const line = text.trim();
+      if (line) {
+        if (track === 'inbound_track') buf.caller.push(line);
+        else if (track === 'outbound_track') buf.assistant.push(line);
+        else buf.raw.push(line);
+      }
+      return res.status(200).send('ok');
+    }
+
+    if (ev === 'transcription-stopped' || ev === 'transcription-error') {
+      console.log('TRANSCRIPT finished', callSid, ev);
+      // Combine
+      let transcript = '';
+      if (buf.caller.length || buf.assistant.length) {
+        const caller = buf.caller.join(' ');
+        const agent  = buf.assistant.join(' ');
+        transcript =
+          (caller ? `Caller: ${caller}\n` : '') +
+          (agent  ? `Assistant: ${agent}\n` : '');
+      } else {
+        transcript = buf.raw.join(' ');
+      }
+
+      // Ship to Google Apps Script (append to Calls)
+      try {
+        const form = new URLSearchParams();
+        form.set('CallSid', callSid);
+        form.set('transcript', transcript || '');
+        // optional: pass From/To if you have them available in memory via some store
+        await fetch(GOOGLE_APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString()
+        });
+      } catch (e) {
+        console.log('Apps Script POST failed:', e?.message);
+      } finally {
+        transcripts.delete(callSid);
+      }
+      return res.status(200).send('ok');
+    }
+
+    // Unknown event
+    return res.status(200).send('ok');
+  } catch (e) {
+    console.log('TRANSCRIPT handler error:', e?.message);
+    return res.status(200).send('ok');
+  }
+});
 
 /* ================= HTTP server + /media WebSocket ================= */
 const server = createServer(app);
@@ -165,7 +267,6 @@ wss.on('connection', (twilioWS, req) => {
     if (!aiReady) return;
     if (!latestConfig) latestConfig = await getConfigCached();
 
-    // Identify VIP by caller number (if provided via Twilio <Parameter>)
     if (callerFrom && latestConfig.vips?.length) {
       const norm = normalizePhone(callerFrom);
       const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
@@ -198,7 +299,7 @@ wss.on('connection', (twilioWS, req) => {
     console.log('AI: connected');
     aiReady = true;
     latestConfig = await getConfigCached();
-    await applySessionConfig('on-open'); // first config push as early as possible
+    await applySessionConfig('on-open');
   });
 
   aiWS.on('message', (raw, isBinary) => {
@@ -243,18 +344,26 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
 
-          // Pull caller number from Twilio <Parameter name="from" ... />
           try {
             const params = data.start?.customParameters || [];
             const fromParam = Array.isArray(params) ? params.find(p => p?.name === 'from') : null;
-            callerFrom = fromParam?.value || null;
-            if (callerFrom) console.log('CallerID (From) received:', callerFrom);
+            const toParam   = Array.isArray(params) ? params.find(p => p?.name === 'to')   : null;
+            const callParam = Array.isArray(params) ? params.find(p => p?.name === 'callSid') : null;
+            const callSid = callParam?.value || null;
+            const from = fromParam?.value || null;
+
+            if (from) console.log('CallerID (From) received:', from);
+            if (callSid && !transcripts.has(callSid)) transcripts.set(callSid, { caller: [], assistant: [], raw: [] });
+            if (from && callSid) {
+              // Optionally seed transcript header
+              const buf = transcripts.get(callSid);
+              buf.raw.push(`CallerID: ${from}`);
+            }
+            callerFrom = from;
           } catch {}
 
-          // After we know callerFrom, re-apply session config (to set VIP voice/skip rules)
           await applySessionConfig('on-start');
 
-          // Clear any prior buffer
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
@@ -286,4 +395,4 @@ wss.on('connection', (twilioWS, req) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
+const server = app.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
