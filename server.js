@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
@@ -56,7 +57,6 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 const GOOGLE_APPS_SCRIPT_URL =
   process.env.GOOGLE_APPS_SCRIPT_URL ||
-  // Keep equal to your Apps Script deployment /exec (used for logging)
   'https://script.google.com/macros/s/AKfycbxAIANRmjl_FIzeEsbC5UNT64IBYK1ITGalpGH7zKRcDw_9dDViL27ld8fir_lYrTPp/exec';
 
 const CONFIG_URL =
@@ -125,7 +125,7 @@ function chooseVoice(defaultVoice, vip) {
   return female;
 }
 
-function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
+function buildInstructions(system_prompt, vips, callerNumber, callerVip, callerName) {
   const vipMap = vips
     .filter(v => v.phone)
     .map(v => `${normalizePhone(v.phone)}=${v.name}`)
@@ -136,7 +136,12 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
     VIP_SKIP_NUMBER,
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
-  if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
+  if (callerNumber || callerName) {
+    const parts = [];
+    if (callerName) parts.push(`Name: ${callerName}`);
+    if (callerNumber) parts.push(`Number: ${normalizePhone(callerNumber)}`);
+    lines.push(`[CALL CONTEXT] Caller -> ${parts.join(', ')}.`);
+  }
   if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
   const text = lines.filter(Boolean).join('\n');
   return text;
@@ -144,7 +149,7 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
 
 /* ================= /transcripts webhook (with GREETING FILTER) ================= */
 
-// Edit/extend with any variants you use in <Say>
+// Greeting variants to ignore in transcript
 const GREETING_PREFIXES = [
   "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
   "Hi, this is Trinity, Dan Hurley AI assistant",
@@ -157,16 +162,9 @@ function isGreeting(line) {
       || (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-// In-memory transcript buffers keyed by CallSid
+// Per-call buffer & metadata store
+// transcripts.set(CallSid, { caller:[], assistant:[], raw:[], greetingSkipped:false, meta:{from,to,callerName} })
 const transcripts = new Map();
-/*
-  transcripts.set(callSid, {
-    caller: [],
-    assistant: [],
-    raw: [],
-    greetingSkipped: false
-  })
-*/
 
 // --- Telegram helper (no extra deps; uses Bot API directly) ---
 async function sendTelegramMessage(text) {
@@ -177,14 +175,10 @@ async function sendTelegramMessage(text) {
     return;
   }
   const endpoint = `https://api.telegram.org/bot${token}/sendMessage`;
+  const MAX = 3800; // headroom under 4096
 
-  // Telegram text limit ~4096 chars. Send in chunks.
-  const MAX = 3800; // leave headroom
-  const chunks = [];
   for (let i = 0; i < text.length; i += MAX) {
-    chunks.push(text.slice(i, i + MAX));
-  }
-  for (const part of chunks) {
+    const part = text.slice(i, i + MAX);
     try {
       await fetch(endpoint, {
         method: 'POST',
@@ -208,7 +202,7 @@ app.post('/transcripts', async (req, res) => {
 
     // Ensure buffer
     if (!transcripts.has(callSid)) {
-      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: {} });
     }
     const buf = transcripts.get(callSid);
 
@@ -250,7 +244,7 @@ app.post('/transcripts', async (req, res) => {
     if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       console.log('TRANSCRIPT finished', callSid, ev);
 
-      // Build a readable transcript
+      // Build readable transcript
       let transcript = '';
       if (buf.caller.length || buf.assistant.length) {
         const caller = buf.caller.join(' ');
@@ -262,9 +256,17 @@ app.post('/transcripts', async (req, res) => {
         transcript = buf.raw.join(' ');
       }
 
-      // Ship to Google Apps Script (append to Calls)
+      // Metadata for headers
+      const from = buf.meta?.from || '';
+      const to = buf.meta?.to || '';
+      const callerName = buf.meta?.callerName || '';
+
+      // POST to Google Apps Script
       try {
         const form = new URLSearchParams();
+        if (from) form.set('From', from);
+        if (to) form.set('To', to);
+        if (callerName) form.set('CallerName', callerName);
         form.set('CallSid', callSid);
         form.set('transcript', transcript || '');
         await fetch(GOOGLE_APPS_SCRIPT_URL, {
@@ -276,11 +278,15 @@ app.post('/transcripts', async (req, res) => {
         console.log('Apps Script POST failed:', e?.message);
       }
 
-      // Send to Telegram (header + body, chunked if needed)
-      const header = `📞 New Call Transcript\nCallSid: ${callSid}\n\n`;
+      // Telegram alert
+      const namePart = callerName ? `${callerName}` : 'Unknown';
+      const numberPart = from || 'Unknown';
+      const toPart = to || 'Unknown';
+      const header =
+        `📞 New Call\nFrom: ${namePart} ${numberPart}\nTo: ${toPart}\nCallSid: ${callSid}\n\n`;
       await sendTelegramMessage(header + (transcript || '(empty)'));
 
-      // Always clean up buffer
+      // Cleanup
       transcripts.delete(callSid);
       return res.status(200).send('ok');
     }
@@ -302,6 +308,7 @@ wss.on('connection', (twilioWS, req) => {
 
   let streamSid = null;
   let callerFrom = null;
+  let callerName = null;
   let callerVip = null;
   let currentVoice = process.env.DEFAULT_VOICE || 'marin';
   const counters = { frames: 0, sentChunks: 0 };
@@ -321,7 +328,7 @@ wss.on('connection', (twilioWS, req) => {
     if (!aiReady) return;
     if (!latestConfig) latestConfig = await getConfigCached();
 
-    // Identify VIP by caller number (if provided via Twilio <Parameter>)
+    // Identify VIP by caller number (if provided)
     if (callerFrom && latestConfig.vips?.length) {
       const norm = normalizePhone(callerFrom);
       const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
@@ -329,7 +336,13 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-    const instructions = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
+    const instructions = buildInstructions(
+      latestConfig.system_prompt,
+      latestConfig.vips,
+      callerFrom,
+      callerVip,
+      callerName
+    );
 
     console.log(
       `Applying session config (${reason}) -> voice=${selectedVoice}` +
@@ -394,29 +407,39 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: connected event');
           break;
 
-        case 'start':
+        case 'start': {
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
 
-          // Pull caller number from Twilio <Parameter name="from" ... />
+          // Pull custom parameters from Twilio <Stream>
           try {
             const params = data.start?.customParameters || [];
-            const fromParam = Array.isArray(params) ? params.find(p => p?.name === 'from') : null;
-            const callParam = Array.isArray(params) ? params.find(p => p?.name === 'callSid') : null;
-            const callSidParam = callParam?.value || null;
-            const from = fromParam?.value || null;
+            const getParam = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || null;
+            const fromParam       = getParam('from');
+            const toParam         = getParam('to');
+            const callSidParam    = getParam('callSid');
+            const callerNameParam = getParam('callerName');
 
-            if (from) console.log('CallerID (From) received:', from);
+            callerFrom = fromParam;
+            callerName = callerNameParam;
+
+            if (callerFrom) console.log('CallerID (From):', callerFrom);
+            if (callerName) console.log('Caller Name:', callerName);
+
+            // Ensure transcript buffer exists and store meta for webhook use
             if (callSidParam && !transcripts.has(callSidParam)) {
-              transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false });
+              transcripts.set(callSidParam, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: {} });
             }
-            if (from && callSidParam) {
-              // Optional header; not included in final Caller/Assistant output
+            if (callSidParam) {
               const buf = transcripts.get(callSidParam);
-              if (buf) buf.raw.push(`CallerID: ${from}`);
+              buf.meta = {
+                ...(buf.meta || {}),
+                from: fromParam || buf.meta?.from,
+                to: toParam || buf.meta?.to,
+                callerName: callerNameParam || buf.meta?.callerName
+              };
             }
-            callerFrom = from;
           } catch {}
 
           await applySessionConfig('on-start');
@@ -425,6 +448,7 @@ wss.on('connection', (twilioWS, req) => {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
           break;
+        }
 
         case 'media':
           counters.frames++;
@@ -453,4 +477,3 @@ wss.on('connection', (twilioWS, req) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
-
