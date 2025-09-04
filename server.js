@@ -145,13 +145,13 @@ function isGreeting(line) {
          (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-/* ================= Transcript store (now also holds meta) ================= */
+/* ================= Transcript store (now timeline events) ================= */
+// Map<CallSid, {
+//   events: Array<{ role:'assistant'|'caller', text:string, ts:number }>,
+//   greetingSkipped: boolean,
+//   meta: { from: string, to: string, callerName: string }
+// }>
 const transcripts = new Map();
-// transcripts.set(callSid, {
-//   caller: [], assistant: [], raw: [],
-//   greetingSkipped: false,
-//   meta: { from: '', to: '', callerName: '' }
-// });
 
 /* ================= Telegram helper ================= */
 async function sendTelegramMessage(text) {
@@ -182,6 +182,35 @@ function displayNameAndNumber(name, num){
   return 'Unknown';
 }
 
+/* ================= Interleaved transcript rendering ================= */
+const COALESCE_WINDOW_MS = 2000; // merge adjacent same-role chunks within 2s
+
+function buildInterleavedTranscript(events) {
+  if (!Array.isArray(events) || events.length === 0) return '';
+
+  // 1) sort by timestamp
+  const sorted = [...events].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+  // 2) coalesce adjacent same-role chunks (within window)
+  const merged = [];
+  for (const e of sorted) {
+    const role = e.role === 'assistant' ? 'Assistant' : 'Caller';
+    const text = (e.text || '').trim();
+    if (!text) continue;
+
+    const last = merged[merged.length - 1];
+    if (last && last.role === role && (e.ts - last.tsLast) <= COALESCE_WINDOW_MS) {
+      last.text += (last.text.endsWith('-') ? '' : ' ') + text;
+      last.tsLast = e.ts;
+    } else {
+      merged.push({ role, text, tsFirst: e.ts, tsLast: e.ts });
+    }
+  }
+
+  // 3) render as alternating blocks
+  return merged.map(turn => `${turn.role}:\n${turn.text}`).join('\n\n');
+}
+
 /* ================= /transcripts webhook ================= */
 app.post('/transcripts', async (req, res) => {
   try {
@@ -191,7 +220,7 @@ app.post('/transcripts', async (req, res) => {
 
     // Ensure buffer & meta (prefer query params if present)
     if (!transcripts.has(callSid)) {
-      transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
+      transcripts.set(callSid, { events: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
     }
     const buf = transcripts.get(callSid);
 
@@ -223,7 +252,7 @@ app.post('/transcripts', async (req, res) => {
       const line = (text || '').trim();
       if (!line) return res.status(200).send('ok');
 
-      const track = (req.body.Track || req.body.track || '').toLowerCase();
+      const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track
 
       // Drop first assistant greeting
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
@@ -231,9 +260,17 @@ app.post('/transcripts', async (req, res) => {
         return res.status(200).send('ok');
       }
 
-      if (track === 'inbound_track') buf.caller.push(line);
-      else if (track === 'outbound_track') buf.assistant.push(line);
-      else buf.raw.push(line);
+      // Determine role
+      let role = null;
+      if (track === 'inbound_track') role = 'caller';
+      else if (track === 'outbound_track') role = 'assistant';
+
+      if (role) {
+        buf.events.push({ role, text: line, ts: Date.now() });
+      } else {
+        // Unknown track; append as caller by default to avoid losing content
+        buf.events.push({ role: 'caller', text: line, ts: Date.now() });
+      }
 
       return res.status(200).send('ok');
     }
@@ -241,17 +278,8 @@ app.post('/transcripts', async (req, res) => {
     if (ev === 'transcription-stopped' || ev === 'transcription-error') {
       console.log('TRANSCRIPT finished', callSid, ev);
 
-      // Build transcript text
-      let transcript = '';
-      if (buf.caller.length || buf.assistant.length) {
-        const caller = buf.caller.join(' ');
-        const agent  = buf.assistant.join(' ');
-        transcript =
-          (caller ? `Caller:\n${caller}\n\n` : '') +
-          (agent  ? `Assistant:\n${agent}\n` : '');
-      } else {
-        transcript = buf.raw.join(' ');
-      }
+      // Build interleaved transcript
+      const transcript = buildInterleavedTranscript(buf.events);
 
       // Post to Google Apps Script with meta so columns fill
       try {
@@ -397,7 +425,7 @@ wss.on('connection', (twilioWS, req) => {
 
             if (callSid) {
               if (!transcripts.has(callSid)) {
-                transcripts.set(callSid, { caller: [], assistant: [], raw: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
+                transcripts.set(callSid, { events: [], greetingSkipped: false, meta: { from: '', to: '', callerName: '' } });
               }
               const buf = transcripts.get(callSid);
               if (from && !buf.meta.from) buf.meta.from = from;
@@ -439,5 +467,5 @@ wss.on('connection', (twilioWS, req) => {
 });
 
 const PORT = process.env.PORT || 10000;
+const server = createServer(app);
 server.listen(PORT, () => console.log(`Trinity gateway listening on :${PORT}`));
-
