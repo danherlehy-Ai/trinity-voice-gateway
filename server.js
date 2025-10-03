@@ -48,11 +48,30 @@ function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters
 
 /* ================= App & config ================= */
 const app = express();
-app.use(express.urlencoded({ extended: false, limit: '2mb' }));
-app.use(express.json({ limit: '5mb' }));
+// Increased limits to avoid 413s from transcription payloads
+app.use(express.urlencoded({ extended: false, limit: '20mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+// Stream status callback (from <Stream statusCallback="...">)
+app.post('/stream-status', (req, res) => {
+  try {
+    const b = req.body || {};
+    console.log(
+      'STREAM STATUS:',
+      'event=', b.Event || b.event,
+      'streamSid=', b.StreamSid || b.streamSid,
+      'callSid=', b.CallSid || b.callSid,
+      'startTime=', b.StartTime || b.startTime,
+      'stopReason=', b.StopReason || b.stopReason
+    );
+  } catch (e) {
+    console.log('STREAM STATUS parse error:', e?.message);
+  }
+  res.status(204).end();
+});
 
 const GOOGLE_APPS_SCRIPT_URL =
   process.env.GOOGLE_APPS_SCRIPT_URL ||
