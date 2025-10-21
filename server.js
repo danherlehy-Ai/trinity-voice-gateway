@@ -48,14 +48,14 @@ function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters
 
 /* ================= App & config ================= */
 const app = express();
-// Increased limits to avoid 413s from transcription payloads
+// Higher limits to avoid 413 on transcription payloads
 app.use(express.urlencoded({ extended: false, limit: '20mb' }));
 app.use(express.json({ limit: '20mb' }));
 
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Stream status callback (from <Stream statusCallback="...">)
+// Stream status callback (optional visibility; safe no-op if unused)
 app.post('/stream-status', (req, res) => {
   try {
     const b = req.body || {};
@@ -125,11 +125,12 @@ const ENGLISH_GUARD =
   'Default language: English (United States). Always speak in English unless the caller explicitly asks for another language. ' +
   'If the caller begins in Spanish, briefly confirm in English and ask if they prefer Spanish; otherwise continue in English.';
 
+// (We keep this, but a broader policy below governs everyone.)
 const VIP_SKIP_NUMBER =
   'If the caller’s phone number matches a VIP number listed below, do NOT ask them to confirm their callback number; ' +
   'assume the caller ID is correct unless they provide a different number.';
 
-// SAFER: coerce anything to string, then strip non-digits
+// Normalize anything to digits only
 function normalizePhone(p){ return String(p ?? '').replace(/\D/g, ''); }
 
 function chooseVoice(defaultVoice, vip) {
@@ -142,38 +143,47 @@ function chooseVoice(defaultVoice, vip) {
   return female;
 }
 
-/**
- * Build core system instructions.
- * Includes brevity guidance so Trinity keeps replies short and easy to interrupt.
- */
 function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
   const vipMap = (Array.isArray(vips) ? vips : [])
     .filter(v => v && v.phone != null)
     .map(v => `${normalizePhone(v.phone)}=${v.name}`)
     .join(', ');
 
-  const BREvITY_RULES =
-    'BREVITY: Keep each reply to 1–2 short sentences (≤ ~40 words total). ' +
-    'Answer concisely, then pause. Prefer quick follow-ups like “Want me to do that?” or “Does that help?”. ' +
-    'Avoid monologues. If unsure, ask a **very brief** clarifying question.';
+  const BREVITY_RULES =
+    'BREVITY: Keep each reply to 1–2 short sentences (≤ ~40 words). ' +
+    'Answer concisely, then pause. Prefer quick follow-ups like “Want me to do that?” or “Does that help?”.';
 
   const INTERRUPT_RULES =
     'INTERRUPTIONS: Stop speaking immediately if the caller talks. Keep phrases tight so barge-in feels natural.';
+
+  // NEW: closing capture policy (used at the END of the call, not the opener)
+  const CALLBACK_POLICY =
+    'CLOSING CAPTURE: When wrapping up, do NOT ask the caller to read their number. ' +
+    'Proactively confirm the last four digits of the caller ID you see. ' +
+    'Say it as: “I have your number ending in {LAST4} — is that right?” ' +
+    'If they say it’s different, politely collect their correct number ONCE. ' +
+    'Then confirm the caller’s name (use the name already provided if available, otherwise ask), ' +
+    'and ask for the best DATE and TIME to call them back. ' +
+    'Keep it warm and efficient.';
 
   const lines = [
     system_prompt || 'You are Trinity.',
     ENGLISH_GUARD,
     VIP_SKIP_NUMBER,
-    BREvITY_RULES,
+    BREVITY_RULES,
     INTERRUPT_RULES,
+    CALLBACK_POLICY,
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
   if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
-  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification.`);
+  // We also pass last4 explicitly so Trinity can reference it naturally at the end
+  const last4 = normalizePhone(callerNumber || '').slice(-4);
+  if (last4) lines.push(`[CALL CONTEXT] CallerID last4: ${last4}.`);
+  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification unless they correct it.`);
   return lines.filter(Boolean).join('\n');
 }
 
-/* ====== Varied conversational openings (kept for non-VIPs) ====== */
+/* ====== Friendly opening variety (model handles “How can I help?” style) ====== */
 const OPENING_VARIANTS = [
   'Warm, upbeat hello; concise and helpful.',
   'Friendly, professional greeting; offer assistance.',
@@ -205,9 +215,6 @@ function isGreeting(line) {
 }
 
 /* ============== Transcript store + idle + DNC state ============== */
-// Map<CallSid, { events: Array<{role:'assistant'|'caller', text:string, ts:number}>, greetingSkipped:boolean,
-//   meta:{from,to,callerName}, lastActivityAt:number, idleTimer:any, aiWS?:WebSocket, twilioWS?:WebSocket,
-//   dnc: { attempted:boolean, reason?:string } }>
 const transcripts = new Map();
 
 /* ================= Telegram helper ================= */
@@ -291,7 +298,6 @@ function isCnamSpam(name='') {
   return /spam|scam/.test(t);
 }
 function buildDigitsString(digitsArr, gapMs) {
-  // 'w' ≈ 0.5s wait in Twilio <Play digits="">
   const waits = Math.max(1, Math.round(gapMs / 500));
   const sep = 'w'.repeat(waits);
   return digitsArr.join(sep);
@@ -311,7 +317,6 @@ async function twilioUpdateCallTwiml(callSid, twiml) {
   const auth = twilioAuthHeader();
   if (!auth) { console.log('Missing Twilio creds; cannot update call TwiML'); return false; }
   const path = `/2010-04-01/Accounts/${auth.accountSid}/Calls/${encodeURIComponent(callSid)}.json`;
-  // Try fetch
   try {
     const url = `https://api.twilio.com${path}`;
     const form = new URLSearchParams();
@@ -331,7 +336,6 @@ async function twilioUpdateCallTwiml(callSid, twiml) {
   } catch (e) {
     console.log('Twilio update fetch failed, falling back to https:', e?.message);
   }
-  // Fallback
   return await new Promise((resolve) => {
     const postData = 'Twiml=' + encodeURIComponent(twiml);
     const options = {
@@ -439,7 +443,7 @@ function resetIdleTimer(callSid) {
 async function triggerIdle(callSid) {
   const s = transcripts.get(callSid);
   if (!s) return;
-  if (s.dnc.attempted) return; // DNC flow will own the end
+  if (s.dnc.attempted) return;
 
   console.log(`IDLE timeout for ${callSid} after ${IDLE_HANGUP_SECS}s`);
   try {
@@ -459,11 +463,10 @@ async function triggerIdle(callSid) {
 /* ============== Auto-DNC: core action ============== */
 async function sendDncDigitsAndMaybeHangup(callSid, reason, digitsArr = AUTO_DNC_DIGITS) {
   const s = getState(callSid);
-  if (s.dnc.attempted) return; // avoid double-fire
+  if (s.dnc.attempted) return;
   s.dnc.attempted = true;
   s.dnc.reason = reason;
 
-  // Build digits string with 'w' waits (≈0.5s) between digits
   const digits = buildDigitsString(digitsArr, AUTO_DNC_GAP_MS);
 
   const sayLine = `<Say language="en-US" voice="Polly.Joanna">${escapeXml(DNC_SAY_LINE)}</Say>`;
@@ -473,14 +476,11 @@ async function sendDncDigitsAndMaybeHangup(callSid, reason, digitsArr = AUTO_DNC
 
   console.log(`AUTO-DNC firing for ${callSid} reason=${reason} digits=${digits}`);
 
-  // Stop idle timer; DNC flow controls the rest of the call
   if (s.idleTimer) { try { clearTimeout(s.idleTimer); } catch {} s.idleTimer = null; }
 
-  // Redirect the live call to the TwiML above
   const ok = await twilioUpdateCallTwiml(callSid, twiml);
   if (!ok) console.log('Auto-DNC Twiml update failed; call may continue.');
 
-  // Log to Google Sheet
   try {
     const form = new URLSearchParams();
     form.set('CallSid', callSid);
@@ -496,7 +496,6 @@ async function sendDncDigitsAndMaybeHangup(callSid, reason, digitsArr = AUTO_DNC
     });
   } catch (e) { console.log('Apps Script DNC log failed:', e?.message); }
 
-  // Close sockets shortly after redirect
   setTimeout(() => {
     try { s.aiWS?.close?.(); } catch {}
     try { s.twilioWS?.close?.(); } catch {}
@@ -517,7 +516,6 @@ app.post('/transcripts', async (req, res) => {
 
     const buf = getState(callSid);
 
-    // Meta from query/body
     const q = req.query || {};
     const fromQ = q.from || req.body.From || req.body.from || '';
     const toQ = q.to || req.body.To || req.body.to || '';
@@ -547,14 +545,12 @@ app.post('/transcripts', async (req, res) => {
 
       const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track
 
-      // Skip our fixed Twilio greeting
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
         buf.greetingSkipped = true;
         bumpActivity(callSid, 'greeting-skip');
         return res.status(200).send('ok');
       }
 
-      // Save event (timeline)
       let role = null;
       if (track === 'inbound_track') role = 'caller';
       else if (track === 'outbound_track') role = 'assistant';
@@ -563,7 +559,6 @@ app.post('/transcripts', async (req, res) => {
 
       bumpActivity(callSid, 'speech');
 
-      // Aggressive auto-DNC: phrase detector (caller or assistant text)
       if (AUTO_DNC_ENABLE && isRemovalPhrase(line)) {
         await sendDncDigitsAndMaybeHangup(callSid, 'phrase');
       }
@@ -642,7 +637,6 @@ wss.on('connection', (twilioWS, req) => {
     const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
 
-    // Keep non-VIP opening variety. VIPs will get a forced opener below.
     const opening = pickOpening();
     const nameHint = safeName({ callerVip, callerName, callerFrom });
     const vipNotes = callerVip?.persona_notes
@@ -650,7 +644,7 @@ wss.on('connection', (twilioWS, req) => {
       : '';
     const openingDirective =
       `OPENING STYLE: ${opening}\n` +
-      `After the phone greeting has played, begin with a short first line. ` +
+      `Start friendly and helpful (e.g., “How can I help today?”). ` +
       `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Keep it to one sentence. ` +
       `Vary your phrasing; avoid repeating the exact words. ${vipNotes}`;
 
@@ -663,7 +657,6 @@ wss.on('connection', (twilioWS, req) => {
       type: 'session.update',
       session: {
         voice: selectedVoice,
-        // Slightly lower threshold → more responsive to caller speech
         turn_detection: { type: 'server_vad', threshold: 0.55 },
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
@@ -682,7 +675,6 @@ wss.on('connection', (twilioWS, req) => {
   aiWS.on('message', (raw, isBinary) => {
     if (!streamSid) return;
 
-    // assistant audio is "activity"
     if (isBinary) {
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
       if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
@@ -749,7 +741,6 @@ wss.on('connection', (twilioWS, req) => {
               resetIdleTimer(currentCallSid);
             }
 
-            // Aggressive auto-DNC on CNAM if allowed and not phrase-only
             if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
               const s = getState(currentCallSid);
               if (isCnamSpam(s.meta.callerName)) {
@@ -760,39 +751,8 @@ wss.on('connection', (twilioWS, req) => {
 
           await applySessionConfig('on-start');
 
-          // === VIP-only first opener (runs only if caller matches a VIP) ===
-          try {
-            if (aiWS.readyState === 1 && latestConfig && callerFrom) {
-              const normFrom = normalizePhone(callerFrom);
-              const vip = (Array.isArray(latestConfig.vips) ? latestConfig.vips : [])
-                .find(v => normalizePhone(v.phone) === normFrom);
-
-              if (vip) {
-                // Prefer Twilio callerName, else VIP name, else generic
-                const display =
-                  (callerName && String(callerName).trim()) ||
-                  (vip.name || 'there');
-
-                const customOpening = vip.opening_line && String(vip.opening_line).trim();
-                const persona = vip.persona_notes && String(vip.persona_notes).trim();
-
-                if (customOpening || persona) {
-                  const opener = customOpening
-                    ? customOpening.replaceAll('{name}', display)
-                    : `Hi ${display}! ${persona} (Had to say it right away.)`;
-
-                  // Fire a one-shot, short opener before normal flow
-                  aiWS.send(JSON.stringify({
-                    type: 'response.create',
-                    response: { instructions: opener }
-                  }));
-                }
-              }
-            }
-          } catch (e) {
-            console.log('VIP-first opener error:', e?.message);
-          }
-
+          // IMPORTANT: do NOT force a one-shot opener here (we want the natural opening)
+          // Also keep buffer cleanup
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
