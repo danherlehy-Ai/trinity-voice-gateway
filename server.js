@@ -125,11 +125,6 @@ const ENGLISH_GUARD =
   'Default language: English (United States). Always speak in English unless the caller explicitly asks for another language. ' +
   'If the caller begins in Spanish, briefly confirm in English and ask if they prefer Spanish; otherwise continue in English.';
 
-// (We keep this, but a broader policy below governs everyone.)
-const VIP_SKIP_NUMBER =
-  'If the caller’s phone number matches a VIP number listed below, do NOT ask them to confirm their callback number; ' +
-  'assume the caller ID is correct unless they provide a different number.';
-
 // Normalize anything to digits only
 function normalizePhone(p){ return String(p ?? '').replace(/\D/g, ''); }
 
@@ -137,7 +132,7 @@ function chooseVoice(defaultVoice, vip) {
   const male = process.env.MALE_VOICE || 'alloy';
   const female = defaultVoice || 'marin';
   if (!vip) return female;
-  const v = (vip.voice_override || '').toLowerCase();
+  const v = (vip?.voice_override || '').toLowerCase();
   if (v === 'male') return male;
   if (v === 'marin' || v === 'female') return female;
   return female;
@@ -150,40 +145,51 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
     .join(', ');
 
   const BREVITY_RULES =
-    'BREVITY: Keep each reply to 1–2 short sentences (≤ ~40 words). ' +
-    'Answer concisely, then pause. Prefer quick follow-ups like “Want me to do that?” or “Does that help?”.';
+    'BREVITY: Keep each reply to 1–2 short sentences (≤ ~40 words). Answer concisely, then pause.';
 
   const INTERRUPT_RULES =
     'INTERRUPTIONS: Stop speaking immediately if the caller talks. Keep phrases tight so barge-in feels natural.';
 
-  // NEW: closing capture policy (used at the END of the call, not the opener)
+  // UNIVERSAL last-4 policy + HARD BANS to prevent asking for full number
   const CALLBACK_POLICY =
-    'CLOSING CAPTURE: When wrapping up, do NOT ask the caller to read their number. ' +
-    'Proactively confirm the last four digits of the caller ID you see. ' +
-    'Say it as: “I have your number ending in {LAST4} — is that right?” ' +
-    'If they say it’s different, politely collect their correct number ONCE. ' +
-    'Then confirm the caller’s name (use the name already provided if available, otherwise ask), ' +
-    'and ask for the best DATE and TIME to call them back. ' +
+    'CLOSING CAPTURE (UNIVERSAL): When wrapping up, do NOT ask the caller to read their number. ' +
+    'Proactively confirm the last four digits from caller ID. ' +
+    'Say exactly: “I have your number ending in {LAST4} — is that right?” ' +
+    'If they say it’s different, politely collect their correct number ONCE, then move on. ' +
+    'Then confirm the caller’s name (use what they already gave if possible), and ask for the best DATE and TIME for a callback. ' +
     'Keep it warm and efficient.';
+
+  const HARD_BANS =
+    'NEVER SAY or ASK: “What’s your number?”, “Can I get your phone number?”, “What’s a good callback number?”, ' +
+    'or any request for the full number, unless the caller states the caller ID is wrong. ' +
+    'If you begin to ask for a number, stop and instead use: “I have your number ending in {LAST4} — is that right?”.';
+
+  const EXAMPLES =
+    'RIGHT: “I have your number ending in {LAST4} — is that right? And is your name Sam? What time is best to call you back?” ' +
+    'WRONG: “What’s the best callback number for you?” ' +
+    'WRONG: “Can you read me your phone number?”';
 
   const lines = [
     system_prompt || 'You are Trinity.',
     ENGLISH_GUARD,
-    VIP_SKIP_NUMBER,
     BREVITY_RULES,
     INTERRUPT_RULES,
     CALLBACK_POLICY,
+    HARD_BANS,
+    EXAMPLES,
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
-  if (callerNumber) lines.push(`[CALL CONTEXT] CallerID: ${normalizePhone(callerNumber)}.`);
-  // We also pass last4 explicitly so Trinity can reference it naturally at the end
-  const last4 = normalizePhone(callerNumber || '').slice(-4);
+
+  const norm = normalizePhone(callerNumber || '');
+  if (norm) lines.push(`[CALL CONTEXT] CallerID: ${norm}.`);
+  const last4 = norm.slice(-4);
   if (last4) lines.push(`[CALL CONTEXT] CallerID last4: ${last4}.`);
-  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Skip number verification unless they correct it.`);
+  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Still use the last-4 confirmation flow unless they correct it.`);
+
   return lines.filter(Boolean).join('\n');
 }
 
-/* ====== Friendly opening variety (model handles “How can I help?” style) ====== */
+/* ====== Friendly opening variety (model does “How can I help?” style) ====== */
 const OPENING_VARIANTS = [
   'Warm, upbeat hello; concise and helpful.',
   'Friendly, professional greeting; offer assistance.',
@@ -751,8 +757,7 @@ wss.on('connection', (twilioWS, req) => {
 
           await applySessionConfig('on-start');
 
-          // IMPORTANT: do NOT force a one-shot opener here (we want the natural opening)
-          // Also keep buffer cleanup
+          // Keep natural opening; no one-shot injected lines here.
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
