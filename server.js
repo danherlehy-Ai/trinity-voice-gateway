@@ -223,7 +223,7 @@ function isGreeting(line) {
 /* ============== Transcript store + idle + DNC state ============== */
 const transcripts = new Map();
 
-/* ================= Telegram helper ================= */
+/* ================= Telegram helper + time formatting ================= */
 async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -250,6 +250,25 @@ function displayNameAndNumber(name, num){
   if (n) return n;
   if (p) return p;
   return 'Unknown';
+}
+
+// --- Telegram date formatting (local timezone) ---
+const TELEGRAM_TZ = process.env.TELEGRAM_TZ || 'America/New_York';
+function formatLocalDateTime(d = new Date()) {
+  try {
+    // Example: Oct 21, 2025 5:36 PM
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: TELEGRAM_TZ,
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: 'numeric',
+      minute: '2-digit'
+    }).format(d);
+  } catch {
+    // Fallback if TZ string is invalid
+    return new Date(d).toLocaleString('en-US', { hour12: true });
+  }
 }
 
 /* ================= Interleaved transcript rendering ================= */
@@ -426,7 +445,7 @@ function getState(callSid) {
     transcripts.set(callSid, {
       events: [],
       greetingSkipped: false,
-      meta: { from: '', to: '', callerName: '' },
+      meta: { from: '', to: '', callerName: '', startedAt: null },
       lastActivityAt: Date.now(),
       idleTimer: null,
       aiWS: undefined,
@@ -532,6 +551,8 @@ app.post('/transcripts', async (req, res) => {
 
     if (ev === 'transcription-started') {
       console.log('TRANSCRIPT started', callSid);
+      const s = getState(callSid);
+      if (!s.meta.startedAt) s.meta.startedAt = new Date();
       bumpActivity(callSid, 'start');
       return res.status(200).send('ok');
     }
@@ -591,11 +612,12 @@ app.post('/transcripts', async (req, res) => {
         });
       } catch (e) { console.log('Apps Script POST failed:', e?.message); }
 
+      // Build Telegram header: include date/time, remove To and CallSid
+      const when = buf.meta.startedAt || new Date();
+      const whenStr = formatLocalDateTime(when);
       const header =
-        `📞 New Call\n` +
-        `From: ${displayNameAndNumber(buf.meta.callerName, buf.meta.from)}\n` +
-        `To: ${buf.meta.to || 'Unknown'}\n` +
-        `CallSid: ${callSid}\n\n`;
+        `📞 New Call — ${whenStr}\n` +
+        `From: ${displayNameAndNumber(buf.meta.callerName, buf.meta.from)}\n\n`;
       await sendTelegramMessage(header + (transcript || '(empty)'));
 
       return res.status(200).send('ok');
@@ -744,6 +766,7 @@ wss.on('connection', (twilioWS, req) => {
               if (from && !s.meta.from) s.meta.from = from;
               if (to && !s.meta.to) s.meta.to = to;
               if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
+              if (!s.meta.startedAt) s.meta.startedAt = new Date(); // earliest start mark
               resetIdleTimer(currentCallSid);
             }
 
