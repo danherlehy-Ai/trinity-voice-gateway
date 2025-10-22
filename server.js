@@ -138,7 +138,28 @@ function chooseVoice(defaultVoice, vip) {
   return female;
 }
 
-function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
+/* === Strict last-4 policy & “no hallucination” rules === */
+const DIGIT_PAUSE_POLICY =
+  'WHEN CALLER RECITES DIGITS (like a phone number or code), DO NOT INTERRUPT. ' +
+  'Stay silent until they finish; wait ~2 seconds after their last digit before replying.';
+
+const NO_HALLUCINATION_LAST4 =
+  'CALLER-ID LAST-4 POLICY: Use ONLY the server-provided last four digits when confirming a number. ' +
+  'You will see [CALL CONTEXT] lines: "CallerID_AVAILABLE: true|false" and "CallerID_LAST4_VERIFIED: ####". ' +
+  'If CallerID_AVAILABLE is true, say exactly: “I have your number ending in {####} — is that right?”. ' +
+  'If CallerID_AVAILABLE is false, say: “Caller ID didn’t show a number on my end.” DO NOT GUESS or invent digits. ' +
+  'NEVER transform or infer digits beyond what is provided. If unsure, state that Caller ID did not appear.';
+
+const CALLBACK_POLICY =
+  'CLOSING CAPTURE: Do NOT ask the caller to read their number. Confirm the server-provided last four as above. ' +
+  'Then confirm their name (use what they already gave if possible) and ask for the best DATE and TIME to call back. ' +
+  'If they say the number is different, politely collect their correct number ONCE and move on.';
+
+const HARD_BANS =
+  'NEVER ASK: “What’s your number?”, “Can I get your phone number?”, or similar, unless the caller says caller ID is wrong. ' +
+  'If you begin to ask, stop and use the last-4 confirmation flow.';
+
+function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
   const vipMap = (Array.isArray(vips) ? vips : [])
     .filter(v => v && v.phone != null)
     .map(v => `${normalizePhone(v.phone)}=${v.name}`)
@@ -146,45 +167,31 @@ function buildInstructions(system_prompt, vips, callerNumber, callerVip) {
 
   const BREVITY_RULES =
     'BREVITY: Keep each reply to 1–2 short sentences (≤ ~40 words). Answer concisely, then pause.';
-
   const INTERRUPT_RULES =
     'INTERRUPTIONS: Stop speaking immediately if the caller talks. Keep phrases tight so barge-in feels natural.';
-
-  // UNIVERSAL last-4 policy + HARD BANS to prevent asking for full number
-  const CALLBACK_POLICY =
-    'CLOSING CAPTURE (UNIVERSAL): When wrapping up, do NOT ask the caller to read their number. ' +
-    'Proactively confirm the last four digits from caller ID. ' +
-    'Say exactly: “I have your number ending in {LAST4} — is that right?” ' +
-    'If they say it’s different, politely collect their correct number ONCE, then move on. ' +
-    'Then confirm the caller’s name (use what they already gave if possible), and ask for the best DATE and TIME for a callback. ' +
-    'Keep it warm and efficient.';
-
-  const HARD_BANS =
-    'NEVER SAY or ASK: “What’s your number?”, “Can I get your phone number?”, “What’s a good callback number?”, ' +
-    'or any request for the full number, unless the caller states the caller ID is wrong. ' +
-    'If you begin to ask for a number, stop and instead use: “I have your number ending in {LAST4} — is that right?”.';
-
-  const EXAMPLES =
-    'RIGHT: “I have your number ending in {LAST4} — is that right? And is your name Sam? What time is best to call you back?” ' +
-    'WRONG: “What’s the best callback number for you?” ' +
-    'WRONG: “Can you read me your phone number?”';
 
   const lines = [
     system_prompt || 'You are Trinity.',
     ENGLISH_GUARD,
-    BREVITY_RULES,
-    INTERRUPT_RULES,
+    DIGIT_PAUSE_POLICY,
+    NO_HALLUCINATION_LAST4,
     CALLBACK_POLICY,
     HARD_BANS,
-    EXAMPLES,
+    BREVITY_RULES,
+    INTERRUPT_RULES,
     vipMap ? `VIP numbers: ${vipMap}.` : ''
   ];
 
-  const norm = normalizePhone(callerNumber || '');
-  if (norm) lines.push(`[CALL CONTEXT] CallerID: ${norm}.`);
+  const norm = normalizePhone(callerNumberRaw || '');
   const last4 = norm.slice(-4);
-  if (last4) lines.push(`[CALL CONTEXT] CallerID last4: ${last4}.`);
-  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Still use the last-4 confirmation flow unless they correct it.`);
+  const available = Boolean(last4);
+  lines.push(`[CALL CONTEXT] CallerID_AVAILABLE: ${available}`);
+  if (available) {
+    lines.push(`[CALL CONTEXT] CallerID: ${norm}.`);
+    lines.push(`[CALL CONTEXT] CallerID_LAST4_VERIFIED: ${last4}.`);
+  }
+
+  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Use the same last-4 rules.`);
 
   return lines.filter(Boolean).join('\n');
 }
@@ -220,7 +227,7 @@ function isGreeting(line) {
          (lower.includes('this is trinity') && lower.includes('assistant'));
 }
 
-/* ============== Transcript store + idle + DNC state ============== */
+/* ============== Transcript store + idle + DNC + number-mode state ============== */
 const transcripts = new Map();
 
 /* ================= Telegram helper + time formatting ================= */
@@ -266,7 +273,6 @@ function formatLocalDateTime(d = new Date()) {
       minute: '2-digit'
     }).format(d);
   } catch {
-    // Fallback if TZ string is invalid
     return new Date(d).toLocaleString('en-US', { hour12: true });
   }
 }
@@ -439,7 +445,10 @@ async function hangupCall(callSid) {
   });
 }
 
-/* ============== Idle helpers ============== */
+/* ============== Idle + number-mode helpers ============== */
+const NUMBER_SILENCE_GRACE_MS = Math.max(1000, Number(process.env.NUMBER_SILENCE_GRACE_MS || 2500));
+const NUMBER_MIN_DIGITS = Math.max(7, Number(process.env.NUMBER_MIN_DIGITS || 10));
+
 function getState(callSid) {
   if (!transcripts.has(callSid)) {
     transcripts.set(callSid, {
@@ -450,7 +459,9 @@ function getState(callSid) {
       idleTimer: null,
       aiWS: undefined,
       twilioWS: undefined,
-      dnc: { attempted: false, reason: '' }
+      dnc: { attempted: false, reason: '' },
+      numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
+      muteAssistant: false
     });
   }
   return transcripts.get(callSid);
@@ -485,51 +496,51 @@ async function triggerIdle(callSid) {
   try { s.twilioWS?.close?.(); } catch {}
 }
 
-/* ============== Auto-DNC: core action ============== */
-async function sendDncDigitsAndMaybeHangup(callSid, reason, digitsArr = AUTO_DNC_DIGITS) {
-  const s = getState(callSid);
-  if (s.dnc.attempted) return;
-  s.dnc.attempted = true;
-  s.dnc.reason = reason;
-
-  const digits = buildDigitsString(digitsArr, AUTO_DNC_GAP_MS);
-
-  const sayLine = `<Say language="en-US" voice="Polly.Joanna">${escapeXml(DNC_SAY_LINE)}</Say>`;
-  const playDigits = `<Play digits="${escapeXml(digits)}"/>`;
-  const hang = DNC_HANGUP_AFTER ? '<Hangup/>' : '';
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response>${sayLine}${playDigits}${hang}</Response>`;
-
-  console.log(`AUTO-DNC firing for ${callSid} reason=${reason} digits=${digits}`);
-
-  if (s.idleTimer) { try { clearTimeout(s.idleTimer); } catch {} s.idleTimer = null; }
-
-  const ok = await twilioUpdateCallTwiml(callSid, twiml);
-  if (!ok) console.log('Auto-DNC Twiml update failed; call may continue.');
-
-  try {
-    const form = new URLSearchParams();
-    form.set('CallSid', callSid);
-    form.set('From', s.meta.from || '');
-    form.set('To', s.meta.to || '');
-    form.set('CallerName', s.meta.callerName || '');
-    form.set('dnc_attempted', 'true');
-    form.set('dnc_result', `auto:${reason}; digits:${digits}`);
-    await fetch(GOOGLE_APPS_SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form.toString()
-    });
-  } catch (e) { console.log('Apps Script DNC log failed:', e?.message); }
-
-  setTimeout(() => {
-    try { s.aiWS?.close?.(); } catch {}
-    try { s.twilioWS?.close?.(); } catch {}
-  }, 2000);
+/* ===== Number-mode detection & control ===== */
+const WORD_TO_DIGIT = {
+  'zero':'0','oh':'0','o':'0',
+  'one':'1','two':'2','three':'3','four':'4','for':'4','five':'5',
+  'six':'6','seven':'7','eight':'8','nine':'9'
+};
+function extractDigits(text='') {
+  const t = String(text).toLowerCase();
+  let digits = t.replace(/[^\d]/g,''); // numeric chars
+  const words = t.split(/[\s\-.,/()]+/);
+  for (const w of words) if (WORD_TO_DIGIT[w]) digits += WORD_TO_DIGIT[w];
+  return digits;
 }
-function escapeXml(s='') {
-  return String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+function maybeEnterNumberMode(callSid, text) {
+  const s = getState(callSid);
+  const found = extractDigits(text);
+  if (!found) return;
+
+  if (!s.numberMode.active && (found.length >= 3 || /[\-\(\)]/.test(text))) {
+    s.numberMode.active = true;
+    s.muteAssistant = true;
+    s.numberMode.digits = '';
+    console.log('Number-mode: ACTIVATED');
+  }
+
+  if (s.numberMode.active) {
+    if (found.length) {
+      s.numberMode.digits += found;
+      s.numberMode.lastDigitAt = Date.now();
+    }
+    if (s.numberMode.timer) clearTimeout(s.numberMode.timer);
+    s.numberMode.timer = setTimeout(() => exitNumberMode(callSid, 'silence'), NUMBER_SILENCE_GRACE_MS);
+
+    if (s.numberMode.digits.length >= NUMBER_MIN_DIGITS) {
+      exitNumberMode(callSid, 'min-digits');
+    }
+  }
+}
+function exitNumberMode(callSid, reason) {
+  const s = getState(callSid);
+  if (!s.numberMode.active) return;
+  s.numberMode.active = false;
+  s.muteAssistant = false;
+  if (s.numberMode.timer) { clearTimeout(s.numberMode.timer); s.numberMode.timer = null; }
+  console.log(`Number-mode: RELEASE (${reason}); collectedDigits=${s.numberMode.digits.length}`);
 }
 
 /* ================= /transcripts webhook ================= */
@@ -584,6 +595,10 @@ app.post('/transcripts', async (req, res) => {
       if (role) buf.events.push({ role, text: line, ts: Date.now() });
       else      buf.events.push({ role: 'caller', text: line, ts: Date.now() });
 
+      if (track === 'inbound_track') {
+        maybeEnterNumberMode(callSid, line);
+      }
+
       bumpActivity(callSid, 'speech');
 
       if (AUTO_DNC_ENABLE && isRemovalPhrase(line)) {
@@ -612,7 +627,7 @@ app.post('/transcripts', async (req, res) => {
         });
       } catch (e) { console.log('Apps Script POST failed:', e?.message); }
 
-      // Build Telegram header: include date/time, remove To and CallSid
+      // Telegram header: include date/time, remove To and CallSid
       const when = buf.meta.startedAt || new Date();
       const whenStr = formatLocalDateTime(when);
       const header =
@@ -641,6 +656,7 @@ wss.on('connection', (twilioWS, req) => {
   let callerFrom = null;
   let callerVip = null;
   let callerName = null;
+  let currentCallSid = null;
   const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
@@ -650,7 +666,6 @@ wss.on('connection', (twilioWS, req) => {
 
   let aiReady = false;
   let latestConfig = null;
-  let currentCallSid = null;
 
   async function applySessionConfig(reason) {
     if (!aiReady) return;
@@ -701,19 +716,24 @@ wss.on('connection', (twilioWS, req) => {
   });
 
   aiWS.on('message', (raw, isBinary) => {
+    // SAFETY: If Twilio stream not ready yet, don't try to send audio
     if (!streamSid) return;
 
+    const s = currentCallSid ? getState(currentCallSid) : null;
+
     if (isBinary) {
+      if (s?.muteAssistant) return; // drop audio while caller reads digits
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
       if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
       return;
     }
     try {
       const msg = JSON.parse(raw.toString());
-      if (!['response.audio.delta', 'response.output_audio.delta'].includes(msg?.type)) {
+      if (!['response.audio.delta','response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
       if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
+        if (s?.muteAssistant) return; // HARD MUTE during number recitation
         const b64 = msg.delta || msg.audio;
         if (b64) {
           chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
@@ -780,7 +800,6 @@ wss.on('connection', (twilioWS, req) => {
 
           await applySessionConfig('on-start');
 
-          // Keep natural opening; no one-shot injected lines here.
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
