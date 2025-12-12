@@ -80,10 +80,21 @@ const CONFIG_URL =
   'https://script.google.com/macros/s/AKfycbxAIANRmjl_FIzeEsbC5UNT64IBYK1ITGalpGH7zKRcDw_9dDViL27ld8fir_lYrTPp/exec';
 
 let _configCache = { when: 0, data: null };
-const CONFIG_TTL_MS = 5 * 60 * 1000;
+
+// ✅ CHANGED: default cache 20 seconds (env override supported)
+const CONFIG_TTL_MS = Math.max(1000, Number(process.env.CONFIG_TTL_MS || 20000));
 
 async function fetchConfigFresh() {
-  const res = await fetch(CONFIG_URL, { method: 'GET' });
+  // ✅ Cache-buster avoids intermediary caching on Google Apps Script
+  const url = CONFIG_URL + (CONFIG_URL.includes('?') ? '&' : '?') + 't=' + Date.now();
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Cache-Control': 'no-store'
+    }
+  });
+
   if (!res.ok) throw new Error(`Config HTTP ${res.status}`);
   const json = await res.json();
   if (!json?.ok) throw new Error(`Config error: ${JSON.stringify(json)}`);
@@ -93,9 +104,11 @@ async function fetchConfigFresh() {
   console.log(`Config OK: prompt=${system_prompt.length} chars, vips=${vips.length}, businesses=${businesses.length}`);
   return { system_prompt, vips, businesses };
 }
-async function getConfigCached() {
+
+// ✅ CHANGED: optional forceFresh
+async function getConfigCached({ forceFresh = false } = {}) {
   const now = Date.now();
-  if (_configCache.data && now - _configCache.when < CONFIG_TTL_MS) return _configCache.data;
+  if (!forceFresh && _configCache.data && now - _configCache.when < CONFIG_TTL_MS) return _configCache.data;
   try {
     const data = await fetchConfigFresh();
     _configCache = { when: now, data };
@@ -108,7 +121,7 @@ async function getConfigCached() {
 
 app.get('/warmup', async (_req, res) => {
   try {
-    await getConfigCached();
+    await getConfigCached({ forceFresh: true });
     try {
       await fetch('https://api.openai.com/v1/models', {
         headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
@@ -125,15 +138,16 @@ const ENGLISH_GUARD =
 
 // Normalize anything to digits only
 function normalizeDigits(p){ return String(p ?? '').replace(/\D/g, ''); }
-// Normalize to last-10 digits (US-friendly). This fixes +1 / 1 / dashes / etc.
+// Normalize to last-10 digits (US-friendly). Fixes +1 / 1 / dashes / etc.
 function normalizeLast10(p){
   const d = normalizeDigits(p);
   if (!d) return '';
   return d.length <= 10 ? d : d.slice(-10);
 }
 
+// ✅ Add cedar to allowed voices
 const ALLOWED_VOICES = new Set([
-  'marin','echo','alloy','ash','ballad','coral','fable','onyx','nova','sage','shimmer','verse'
+  'marin','cedar','echo','alloy','ash','ballad','coral','fable','onyx','nova','sage','shimmer','verse'
 ]);
 
 function chooseVoice(defaultVoice, vip) {
@@ -145,17 +159,16 @@ function chooseVoice(defaultVoice, vip) {
   const raw = String(vip?.voice_override || '').trim().toLowerCase();
   if (!raw) return safeDefault;
 
-  // Back-compat if you ever type "male" / "female"
+  // Back-compat: "male" / "female"
   if (raw === 'male') {
-    const male = String(process.env.MALE_VOICE || 'alloy').toLowerCase();
-    return ALLOWED_VOICES.has(male) ? male : 'alloy';
+    const male = String(process.env.MALE_VOICE || 'ballad').toLowerCase();
+    return ALLOWED_VOICES.has(male) ? male : 'ballad';
   }
   if (raw === 'female') return safeDefault;
 
   // Named voice override
   if (ALLOWED_VOICES.has(raw)) return raw;
 
-  // Unknown → default
   return safeDefault;
 }
 
@@ -184,8 +197,13 @@ const HARD_BANS =
 function safeVipName(vip){
   const n = String(vip?.name || '').trim();
   if (!n) return '';
-  // Use first token as "first name" for greeting
-  return n.split(/\s+/)[0];
+  return n.split(/\s+/)[0]; // first name token
+}
+
+// ✅ optional “tone/vibe” column support
+function safeVipVibe(vip){
+  const v = String(vip?.vibe || vip?.tone || '').trim();
+  return v;
 }
 
 function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
@@ -355,9 +373,7 @@ function buildInterleavedTranscript(events) {
   return merged.map(turn => `${turn.role}:\n${turn.text}`).join('\n\n');
 }
 
-/* ================= Idle hang-up settings =================
-   IMPORTANT: default bumped up so calls don't get chopped.
-*/
+/* ================= Idle hang-up settings ================= */
 const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 180));
 const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowerCase() === 'true';
 const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
@@ -407,9 +423,7 @@ function twilioAuthHeader() {
 /** Retry-friendly sleep */
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-/** Download a Twilio Recording by full URL and return {buffer, ext}
-    NOTE: retries added because Twilio sometimes POSTs before the media is ready.
-*/
+/** Download Twilio Recording URL (retries because Twilio can POST before media is ready) */
 async function downloadTwilioRecording(recordingUrl) {
   const auth = twilioAuthHeader();
   if (!auth) throw new Error('Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN env vars');
@@ -443,8 +457,7 @@ async function downloadTwilioRecording(recordingUrl) {
         console.log(`Recording download attempt failed (attempt ${attempt}):`, String(e?.message || e));
       }
     }
-    // backoff: 1s, 2s, 4s
-    await sleep(1000 * Math.pow(2, attempt - 1));
+    await sleep(1000 * Math.pow(2, attempt - 1)); // 1s,2s,4s
   }
 
   throw lastErr || new Error('Failed to download recording');
@@ -853,11 +866,14 @@ wss.on('connection', (twilioWS, req) => {
     return found || null;
   }
 
-  async function applySessionConfig(reason) {
+  async function applySessionConfig(reason, { forceFresh = false } = {}) {
     if (!aiReady) return;
-    if (!latestConfig) latestConfig = await getConfigCached();
 
-    // ✅ VIP MATCH FIX: use last-10 digits
+    // ✅ If you want “near immediate but not every time”, keep forceFresh=false
+    // We’ll forceFresh on START only (see below) but it will still respect TTL.
+    latestConfig = await getConfigCached({ forceFresh });
+
+    // VIP match uses last-10 digits
     callerVip = matchVipByLast10(latestConfig.vips, callerFrom);
     if (!callerVip) {
       console.log('VIP: no match for', normalizeLast10(callerFrom));
@@ -872,15 +888,27 @@ wss.on('connection', (twilioWS, req) => {
 
     const vipFirst = safeVipName(callerVip);
     const persona = String(callerVip?.persona_notes || '').trim();
+    const vibe = safeVipVibe(callerVip);
 
-    // Force VIP greeting by name (first name), NEVER phone number.
+    // ✅ Stronger “VIP MODE” block so it actually sticks
+    const vipModeBlock = callerVip
+      ? (
+          `\n[V.I.P. MODE — MUST FOLLOW]\n` +
+          `1) Greet the VIP by FIRST NAME immediately: "Hi ${vipFirst}!"\n` +
+          `2) NEVER greet using any phone number.\n` +
+          `3) Stay in the VIP’s requested personality and keep it PG-13 (no hate, threats, or harassment).\n` +
+          (vibe ? `4) VIBE/TONE: ${vibe}\n` : '') +
+          (persona ? `5) PERSONA NOTES: ${persona}\n` : '')
+        )
+      : '';
+
     const openingDirective = callerVip
       ? (
           `OPENING STYLE: ${opening}\n` +
           `MANDATORY VIP GREETING: The caller is a VIP. Greet them by FIRST NAME immediately: "Hi ${vipFirst}!" ` +
           `Do NOT greet with their phone number. Do NOT spell the name.\n` +
-          (persona ? `VIP PERSONA NOTES (obey): ${persona}\n` : '') +
-          `Then ask a single helpful question, short and natural.`
+          `Then ask ONE short helpful question.\n` +
+          vipModeBlock
         )
       : (
           `OPENING STYLE: ${opening}\n` +
@@ -916,9 +944,11 @@ wss.on('connection', (twilioWS, req) => {
     s.greetedOnce = true;
 
     const vipFirst = safeVipName(callerVip);
+
+    // IMPORTANT: even in this “hardwired” instruction, we never include phone digits.
     const greetLine = callerVip
-      ? `Say exactly one short sentence greeting the caller by name: "Hi ${vipFirst} — it’s Trinity." Then one short question to help them. Do NOT mention any phone number.`
-      : `Say exactly: "Hi — it’s Trinity." Then one short question to help. Do NOT mention any phone number.`;
+      ? `Say exactly: "Hi ${vipFirst} — it’s Trinity. How can I help today?"`
+      : `Say exactly: "Hi — it’s Trinity. How can I help today?"`;
 
     console.log('Sending hardwired greeting:', { greetLine, vip: callerVip ? callerVip.name : null });
 
@@ -935,8 +965,8 @@ wss.on('connection', (twilioWS, req) => {
   aiWS.on('open', async () => {
     console.log('AI: connected');
     aiReady = true;
-    latestConfig = await getConfigCached();
-    await applySessionConfig('on-open');
+    latestConfig = await getConfigCached({ forceFresh: false });
+    await applySessionConfig('on-open', { forceFresh: false });
   });
 
   aiWS.on('message', (raw, isBinary) => {
@@ -1031,7 +1061,9 @@ wss.on('connection', (twilioWS, req) => {
             console.log('Start handler param parse error:', e?.message);
           }
 
-          await applySessionConfig('on-start');
+          // ✅ On start, forceFresh=true is SAFE because TTL is short (20s) and fetch is tiny.
+          // If you want *never* force refresh, change true -> false.
+          await applySessionConfig('on-start', { forceFresh: true });
 
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
