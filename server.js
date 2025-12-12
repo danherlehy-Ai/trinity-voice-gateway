@@ -250,6 +250,45 @@ async function sendTelegramMessage(text) {
     }
   }
 }
+
+/**
+ * Send an audio file into Telegram (stores/playable inside Telegram).
+ * - This does NOT save to Drive or GitHub.
+ * - It uploads to Telegram, and Telegram keeps it in your chat history.
+ */
+async function sendTelegramAudio(buffer, filename = 'call-recording.mp3', caption = '') {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) { console.log('Telegram env not set; skipping audio send.'); return false; }
+
+  const endpoint = `https://api.telegram.org/bot${token}/sendAudio`;
+
+  try {
+    const form = new FormData();
+    form.set('chat_id', chatId);
+    if (caption) form.set('caption', caption);
+
+    const blobType =
+      filename.toLowerCase().endsWith('.wav') ? 'audio/wav' :
+      filename.toLowerCase().endsWith('.mp3') ? 'audio/mpeg' :
+      'application/octet-stream';
+
+    const blob = new Blob([buffer], { type: blobType });
+    form.set('audio', blob, filename);
+
+    const resp = await fetch(endpoint, { method: 'POST', body: form });
+    const txt = await resp.text();
+    if (!resp.ok) {
+      console.log('Telegram sendAudio failed:', resp.status, txt.slice(0, 400));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log('Telegram sendAudio exception:', e?.message);
+    return false;
+  }
+}
+
 function displayNameAndNumber(name, num){
   const n = (name || '').trim();
   const p = (num || '').trim();
@@ -344,6 +383,46 @@ function twilioAuthHeader() {
     basic: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64')
   };
 }
+
+/** Download a Twilio Recording by full URL (e.g., RecordingUrl) and return {buffer, contentType, ext} */
+async function downloadTwilioRecording(recordingUrl) {
+  const auth = twilioAuthHeader();
+  if (!auth) throw new Error('Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN env vars');
+
+  const url = String(recordingUrl || '').trim();
+  if (!url) throw new Error('Missing RecordingUrl');
+
+  // Twilio RecordingUrl commonly looks like: https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RE... 
+  // To get media bytes, Twilio supports appending file extensions like .mp3 or .wav.
+  // We'll prefer .mp3 first for easy Telegram playback.
+  const candidates = [
+    url.endsWith('.mp3') ? url : (url + '.mp3'),
+    url.endsWith('.wav') ? url : (url + '.wav'),
+  ];
+
+  let lastErr = null;
+  for (const u of candidates) {
+    try {
+      const resp = await fetch(u, {
+        method: 'GET',
+        headers: { Authorization: auth.basic }
+      });
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} for ${u} :: ${t.slice(0,200)}`);
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const ct = resp.headers.get('content-type') || 'application/octet-stream';
+      const ext = u.endsWith('.wav') ? 'wav' : 'mp3';
+      return { buffer: buf, contentType: ct, ext };
+    } catch (e) {
+      lastErr = e;
+      console.log('Recording download attempt failed:', String(e?.message || e));
+    }
+  }
+  throw lastErr || new Error('Failed to download recording');
+}
+
 async function twilioUpdateCallTwiml(callSid, twiml) {
   const auth = twilioAuthHeader();
   if (!auth) { console.log('Missing Twilio creds; cannot update call TwiML'); return false; }
@@ -642,6 +721,61 @@ app.post('/transcripts', async (req, res) => {
   } catch (e) {
     console.log('TRANSCRIPT handler error:', e?.message);
     return res.status(200).send('ok');
+  }
+});
+
+/* ================= Twilio Recording Webhook =================
+   Twilio will POST here when a recording is completed (if you point recordingStatusCallback to this URL).
+   We download the recording from Twilio (auth required) and then upload it into Telegram as an audio file.
+*/
+app.post('/recordings', async (req, res) => {
+  // IMPORTANT: respond fast to Twilio to avoid retries; do work async after 200 OK
+  res.status(200).send('ok');
+
+  try {
+    const b = req.body || {};
+    const callSid = b.CallSid || b.callsid || '';
+    const from = b.From || b.from || '';
+    const to = b.To || b.to || '';
+    const recordingSid = b.RecordingSid || b.recordingsid || '';
+    const recordingUrl = b.RecordingUrl || b.recordingurl || '';
+
+    console.log('RECORDING webhook received:', {
+      callSid,
+      recordingSid,
+      hasUrl: Boolean(recordingUrl),
+      from,
+      to
+    });
+
+    if (!recordingUrl) {
+      console.log('RECORDING: missing RecordingUrl (nothing to download)');
+      return;
+    }
+
+    // Download bytes from Twilio (MP3 preferred, WAV fallback)
+    const { buffer, ext } = await downloadTwilioRecording(recordingUrl);
+
+    const whenStr = formatLocalDateTime(new Date());
+    const caption =
+      `🎙️ Call Recording — ${whenStr}\n` +
+      (from ? `From: ${from}\n` : '') +
+      (recordingSid ? `RecSid: ${recordingSid}\n` : '') +
+      (callSid ? `CallSid: ${callSid}` : '');
+
+    const filename = `call-${callSid || recordingSid || Date.now()}.${ext}`;
+
+    const ok = await sendTelegramAudio(buffer, filename, caption);
+    if (!ok) {
+      // Fallback: at least send a message with the Twilio RecordingUrl (will require auth to fetch)
+      await sendTelegramMessage(
+        caption + `\n\n(Upload to Telegram failed. Twilio Recording URL may require login/auth.)\n${recordingUrl}`
+      );
+    } else {
+      console.log('RECORDING: sent audio to Telegram:', filename);
+    }
+  } catch (e) {
+    console.log('RECORDING handler error:', e?.message);
   }
 });
 
