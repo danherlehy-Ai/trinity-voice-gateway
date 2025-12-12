@@ -48,14 +48,12 @@ function sendPcm16kBinaryToTwilioAsUlaw(binaryBuf, twilioWS, streamSid, counters
 
 /* ================= App & config ================= */
 const app = express();
-// Higher limits to avoid 413 on transcription payloads
 app.use(express.urlencoded({ extended: false, limit: '20mb' }));
 app.use(express.json({ limit: '20mb' }));
 
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Stream status callback (optional visibility; safe no-op if unused)
 app.post('/stream-status', (req, res) => {
   try {
     const b = req.body || {};
@@ -126,44 +124,39 @@ const ENGLISH_GUARD =
   'If the caller begins in Spanish, briefly confirm in English and ask if they prefer Spanish; otherwise continue in English.';
 
 // Normalize anything to digits only
-function normalizePhone(p){ return String(p ?? '').replace(/\D/g, ''); }
+function normalizeDigits(p){ return String(p ?? '').replace(/\D/g, ''); }
+// Normalize to last-10 digits (US-friendly). This fixes +1 / 1 / dashes / etc.
+function normalizeLast10(p){
+  const d = normalizeDigits(p);
+  if (!d) return '';
+  return d.length <= 10 ? d : d.slice(-10);
+}
 
-/**
- * Voice selection rules:
- * - If vip.voice_override is "male" => MALE_VOICE (env) or "ballad"
- * - If vip.voice_override is "female" => DEFAULT_VOICE (env) or "marin"
- * - Otherwise vip.voice_override can be a direct voice name (case-insensitive)
- * - If unknown, fall back to default voice (never break the call)
- *
- * Note: OpenAI TTS docs list built-in voices like alloy/ash/ballad/coral/echo/fable/nova/onyx/sage/shimmer (Realtime set can differ). :contentReference[oaicite:1]{index=1}
- */
-const FALLBACK_MALE_VOICE = (process.env.MALE_VOICE || 'ballad').toLowerCase();
-const FALLBACK_DEFAULT_VOICE = (process.env.DEFAULT_VOICE || 'marin').toLowerCase();
-
-// Allow-list (we still allow custom strings, but this prevents common typos silently failing)
-const KNOWN_VOICES = new Set([
-  // common / documented TTS voices
-  'alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer',
-  // user + realtime/your project voices (keep them working)
-  'marin','cedar','verse'
+const ALLOWED_VOICES = new Set([
+  'marin','echo','alloy','ash','ballad','coral','fable','onyx','nova','sage','shimmer','verse'
 ]);
 
-function chooseVoice(vip) {
-  const def = FALLBACK_DEFAULT_VOICE;
-  const raw = String(vip?.voice_override ?? '').trim();
-  if (!raw) return def;
+function chooseVoice(defaultVoice, vip) {
+  const def = (defaultVoice || 'marin').toLowerCase();
+  const safeDefault = ALLOWED_VOICES.has(def) ? def : 'marin';
 
-  const v = raw.toLowerCase();
+  if (!vip) return safeDefault;
 
-  if (v === 'male') return FALLBACK_MALE_VOICE;
-  if (v === 'female') return def;
+  const raw = String(vip?.voice_override || '').trim().toLowerCase();
+  if (!raw) return safeDefault;
 
-  // If it's a known voice, use it
-  if (KNOWN_VOICES.has(v)) return v;
+  // Back-compat if you ever type "male" / "female"
+  if (raw === 'male') {
+    const male = String(process.env.MALE_VOICE || 'alloy').toLowerCase();
+    return ALLOWED_VOICES.has(male) ? male : 'alloy';
+  }
+  if (raw === 'female') return safeDefault;
 
-  // Otherwise: try using it anyway (OpenAI may accept newer voices); if not, OpenAI will error and we’ll fall back next update
-  console.log(`⚠️ Unknown voice_override="${raw}" (using it anyway). If it fails, it will fall back to "${def}".`);
-  return v;
+  // Named voice override
+  if (ALLOWED_VOICES.has(raw)) return raw;
+
+  // Unknown → default
+  return safeDefault;
 }
 
 /* === Strict last-4 policy & “no hallucination” rules === */
@@ -187,10 +180,18 @@ const HARD_BANS =
   'NEVER ASK: “What’s your number?”, “Can I get your phone number?”, or similar, unless the caller says caller ID is wrong. ' +
   'If you begin to ask, stop and use the last-4 confirmation flow.';
 
+// IMPORTANT: DO NOT greet using phone numbers.
+function safeVipName(vip){
+  const n = String(vip?.name || '').trim();
+  if (!n) return '';
+  // Use first token as "first name" for greeting
+  return n.split(/\s+/)[0];
+}
+
 function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
   const vipMap = (Array.isArray(vips) ? vips : [])
     .filter(v => v && v.phone != null)
-    .map(v => `${normalizePhone(v.phone)}=${v.name}`)
+    .map(v => `${normalizeLast10(v.phone)}=${String(v.name || '').trim()}`)
     .join(', ');
 
   const BREVITY_RULES =
@@ -207,39 +208,26 @@ function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
     HARD_BANS,
     BREVITY_RULES,
     INTERRUPT_RULES,
-    vipMap ? `VIP numbers: ${vipMap}.` : ''
+    vipMap ? `VIP numbers (last-10): ${vipMap}.` : ''
   ];
 
-  const norm = normalizePhone(callerNumberRaw || '');
-  const last4 = norm.slice(-4);
+  const norm10 = normalizeLast10(callerNumberRaw || '');
+  const last4 = norm10.slice(-4);
   const available = Boolean(last4);
   lines.push(`[CALL CONTEXT] CallerID_AVAILABLE: ${available}`);
   if (available) {
-    lines.push(`[CALL CONTEXT] CallerID: ${norm}.`);
+    lines.push(`[CALL CONTEXT] CallerID_LAST10: ${norm10}.`);
     lines.push(`[CALL CONTEXT] CallerID_LAST4_VERIFIED: ${last4}.`);
   }
 
   if (callerVip) {
-    lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}).`);
-    // Strong VIP persona enforcement (still safe: playful teasing, not hateful/abusive)
-    if (callerVip.persona_notes && String(callerVip.persona_notes).trim()) {
-      lines.push(
-        `[VIP PERSONA RULES] For THIS caller ONLY, strongly adopt these traits:\n` +
-        `${String(callerVip.persona_notes).trim()}\n` +
-        `Keep it playful and PG (no cruelty, no slurs, no harassment).`
-      );
-    }
-    // Optional future fields (won't break if absent)
-    const vibe = String(callerVip.vibe || callerVip.tone || callerVip.style || '').trim();
-    if (vibe) {
-      lines.push(`[VIP VIBE] Use this overall vibe for the entire call: ${vibe}`);
-    }
+    lines.push(`[CALL CONTEXT] Recognized VIP: ${String(callerVip.name)} (${String(callerVip.relationship || 'VIP')}).`);
   }
 
   return lines.filter(Boolean).join('\n');
 }
 
-/* ====== Friendly opening variety (model does “How can I help?” style) ====== */
+/* ====== Friendly opening variety ====== */
 const OPENING_VARIANTS = [
   'Warm, upbeat hello; concise and helpful.',
   'Friendly, professional greeting; offer assistance.',
@@ -249,12 +237,6 @@ const OPENING_VARIANTS = [
 ];
 function pickOpening() {
   return OPENING_VARIANTS[Math.floor(Math.random() * OPENING_VARIANTS.length)];
-}
-function safeName({ callerVip, callerName, callerFrom }) {
-  if (callerVip?.name) return callerVip.name;
-  if (callerName && String(callerName).trim()) return String(callerName).trim();
-  if (callerFrom && String(callerFrom).trim()) return String(callerFrom).trim();
-  return 'there';
 }
 
 /* ================= Greeting filter ================= */
@@ -373,8 +355,10 @@ function buildInterleavedTranscript(events) {
   return merged.map(turn => `${turn.role}:\n${turn.text}`).join('\n\n');
 }
 
-/* ================= Idle hang-up settings ================= */
-const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 30));
+/* ================= Idle hang-up settings =================
+   IMPORTANT: default bumped up so calls don't get chopped.
+*/
+const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 180));
 const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowerCase() === 'true';
 const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
 
@@ -420,6 +404,12 @@ function twilioAuthHeader() {
   };
 }
 
+/** Retry-friendly sleep */
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+/** Download a Twilio Recording by full URL and return {buffer, ext}
+    NOTE: retries added because Twilio sometimes POSTs before the media is ready.
+*/
 async function downloadTwilioRecording(recordingUrl) {
   const auth = twilioAuthHeader();
   if (!auth) throw new Error('Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN env vars');
@@ -433,25 +423,30 @@ async function downloadTwilioRecording(recordingUrl) {
   ];
 
   let lastErr = null;
-  for (const u of candidates) {
-    try {
-      const resp = await fetch(u, {
-        method: 'GET',
-        headers: { Authorization: auth.basic }
-      });
-      if (!resp.ok) {
-        const t = await resp.text().catch(() => '');
-        throw new Error(`HTTP ${resp.status} for ${u} :: ${t.slice(0,200)}`);
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    for (const u of candidates) {
+      try {
+        const resp = await fetch(u, {
+          method: 'GET',
+          headers: { Authorization: auth.basic }
+        });
+        if (!resp.ok) {
+          const t = await resp.text().catch(() => '');
+          throw new Error(`HTTP ${resp.status} for ${u} :: ${t.slice(0,200)}`);
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const ext = u.endsWith('.wav') ? 'wav' : 'mp3';
+        return { buffer: buf, ext };
+      } catch (e) {
+        lastErr = e;
+        console.log(`Recording download attempt failed (attempt ${attempt}):`, String(e?.message || e));
       }
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const ct = resp.headers.get('content-type') || 'application/octet-stream';
-      const ext = u.endsWith('.wav') ? 'wav' : 'mp3';
-      return { buffer: buf, contentType: ct, ext };
-    } catch (e) {
-      lastErr = e;
-      console.log('Recording download attempt failed:', String(e?.message || e));
     }
+    // backoff: 1s, 2s, 4s
+    await sleep(1000 * Math.pow(2, attempt - 1));
   }
+
   throw lastErr || new Error('Failed to download recording');
 }
 
@@ -505,6 +500,7 @@ async function twilioUpdateCallTwiml(callSid, twiml) {
     req.end();
   });
 }
+
 async function hangupCall(callSid) {
   const auth = twilioAuthHeader();
   if (!auth) { console.log('Missing Twilio creds; cannot hang up.'); return false; }
@@ -572,11 +568,13 @@ function getState(callSid) {
       twilioWS: undefined,
       dnc: { attempted: false, reason: '' },
       numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
-      muteAssistant: false
+      muteAssistant: false,
+      greetedOnce: false
     });
   }
   return transcripts.get(callSid);
 }
+
 function bumpActivity(callSid, _reason) {
   const s = getState(callSid);
   s.lastActivityAt = Date.now();
@@ -596,7 +594,7 @@ async function triggerIdle(callSid) {
   try {
     if (IDLE_SEND_GOODBYE && s.aiWS && s.aiWS.readyState === 1) {
       s.aiWS.send(JSON.stringify({ type: 'response.create', response: { instructions: GOODBYE_LINE } }));
-      await new Promise(r => setTimeout(r, 1500));
+      await sleep(1500);
     }
   } catch (e) { console.log('Idle goodbye send failed:', e?.message); }
 
@@ -615,7 +613,7 @@ const WORD_TO_DIGIT = {
 };
 function extractDigits(text='') {
   const t = String(text).toLowerCase();
-  let digits = t.replace(/[^\d]/g,''); // numeric chars
+  let digits = t.replace(/[^\d]/g,'');
   const words = t.split(/[\s\-.,/()]+/);
   for (const w of words) if (WORD_TO_DIGIT[w]) digits += WORD_TO_DIGIT[w];
   return digits;
@@ -654,6 +652,31 @@ function exitNumberMode(callSid, reason) {
   console.log(`Number-mode: RELEASE (${reason}); collectedDigits=${s.numberMode.digits.length}`);
 }
 
+/* ================= Auto-DNC action ================= */
+async function sendDncDigitsAndMaybeHangup(callSid, reason='phrase') {
+  const s = getState(callSid);
+  if (s.dnc.attempted) return;
+  s.dnc.attempted = true;
+  s.dnc.reason = reason;
+
+  try {
+    const digits = buildDigitsString(AUTO_DNC_DIGITS, AUTO_DNC_GAP_MS);
+    const twiml =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<Response>` +
+      `<Say>${DNC_SAY_LINE}</Say>` +
+      `<Pause length="1"/>` +
+      `<Play digits="${digits}"/>` +
+      `${DNC_HANGUP_AFTER ? '<Hangup/>' : ''}` +
+      `</Response>`;
+
+    console.log('AUTO-DNC: updating call TwiML', { callSid, reason, digits });
+    await twilioUpdateCallTwiml(callSid, twiml);
+  } catch (e) {
+    console.log('AUTO-DNC failed:', e?.message);
+  }
+}
+
 /* ================= /transcripts webhook ================= */
 app.post('/transcripts', async (req, res) => {
   try {
@@ -673,8 +696,7 @@ app.post('/transcripts', async (req, res) => {
 
     if (ev === 'transcription-started') {
       console.log('TRANSCRIPT started', callSid);
-      const s = getState(callSid);
-      if (!s.meta.startedAt) s.meta.startedAt = new Date();
+      if (!buf.meta.startedAt) buf.meta.startedAt = new Date();
       bumpActivity(callSid, 'start');
       return res.status(200).send('ok');
     }
@@ -692,7 +714,7 @@ app.post('/transcripts', async (req, res) => {
       const line = (text || '').trim();
       if (!line) { bumpActivity(callSid, 'empty'); return res.status(200).send('ok'); }
 
-      const track = (req.body.Track || req.body.track || '').toLowerCase(); // inbound_track | outbound_track
+      const track = (req.body.Track || req.body.track || '').toLowerCase();
 
       if (track === 'outbound_track' && !buf.greetingSkipped && isGreeting(line)) {
         buf.greetingSkipped = true;
@@ -706,15 +728,11 @@ app.post('/transcripts', async (req, res) => {
       if (role) buf.events.push({ role, text: line, ts: Date.now() });
       else      buf.events.push({ role: 'caller', text: line, ts: Date.now() });
 
-      if (track === 'inbound_track') {
-        maybeEnterNumberMode(callSid, line);
-      }
+      if (track === 'inbound_track') maybeEnterNumberMode(callSid, line);
 
       bumpActivity(callSid, 'speech');
 
       if (AUTO_DNC_ENABLE && isRemovalPhrase(line)) {
-        // NOTE: your existing code referenced sendDncDigitsAndMaybeHangup; leaving behavior untouched.
-        // If you have that function elsewhere, it will work as-is.
         await sendDncDigitsAndMaybeHangup(callSid, 'phrase');
       }
 
@@ -818,8 +836,6 @@ wss.on('connection', (twilioWS, req) => {
   let callerVip = null;
   let callerName = null;
   let currentCallSid = null;
-  let greetedThisCall = false;
-
   const counters = { frames: 0, sentChunks: 0 };
 
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
@@ -830,49 +846,46 @@ wss.on('connection', (twilioWS, req) => {
   let aiReady = false;
   let latestConfig = null;
 
-  function resolveVip(fromDigits, vips) {
-    const norm = normalizePhone(fromDigits || '');
-    if (!norm || !Array.isArray(vips) || !vips.length) return null;
-    const found = vips.find(v => normalizePhone(v.phone) === norm);
+  function matchVipByLast10(vips, from) {
+    const c10 = normalizeLast10(from);
+    if (!c10) return null;
+    const found = (Array.isArray(vips) ? vips : []).find(v => normalizeLast10(v?.phone) === c10);
     return found || null;
-  }
-
-  function buildVipGreetingLine(vip, fallbackName) {
-    const name = (vip?.name || fallbackName || 'there').trim();
-    // Hardwired requirement: VIP must be greeted by name (spoken normally).
-    // Keep it short so it doesn't feel robotic.
-    if (vip?.name) {
-      return `Hi ${name} — it's Trinity. What can I do for you today?`;
-    }
-    return `Hi ${name} — it's Trinity. How can I help today?`;
   }
 
   async function applySessionConfig(reason) {
     if (!aiReady) return;
     if (!latestConfig) latestConfig = await getConfigCached();
 
-    // Re-resolve VIP whenever we have callerFrom
-    if (callerFrom && latestConfig.vips?.length) {
-      const found = resolveVip(callerFrom, latestConfig.vips);
-      if (found) callerVip = found;
+    // ✅ VIP MATCH FIX: use last-10 digits
+    callerVip = matchVipByLast10(latestConfig.vips, callerFrom);
+    if (!callerVip) {
+      console.log('VIP: no match for', normalizeLast10(callerFrom));
+    } else {
+      console.log('VIP: matched', { name: callerVip.name, phone: normalizeLast10(callerVip.phone), from: normalizeLast10(callerFrom) });
     }
 
-    const selectedVoice = chooseVoice(callerVip);
+    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
+
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
-
-    // IMPORTANT: make name greeting mandatory for VIPs (and preferred otherwise)
     const opening = pickOpening();
-    const nameHint = safeName({ callerVip, callerName, callerFrom });
 
-    const vipNotes = callerVip?.persona_notes
-      ? `VIP PERSONA NOTES (apply strongly for this caller): ${String(callerVip.persona_notes)}`
-      : '';
+    const vipFirst = safeVipName(callerVip);
+    const persona = String(callerVip?.persona_notes || '').trim();
 
-    const openingDirective =
-      `OPENING STYLE: ${opening}\n` +
-      `RULE: If a VIP is recognized, you MUST greet them by first name in your very first spoken sentence (e.g., "Hi ${nameHint}! ..."). ` +
-      `If not VIP but you have a name, greet by name anyway. Do not spell names out. Say them normally.\n` +
-      `${vipNotes}`;
+    // Force VIP greeting by name (first name), NEVER phone number.
+    const openingDirective = callerVip
+      ? (
+          `OPENING STYLE: ${opening}\n` +
+          `MANDATORY VIP GREETING: The caller is a VIP. Greet them by FIRST NAME immediately: "Hi ${vipFirst}!" ` +
+          `Do NOT greet with their phone number. Do NOT spell the name.\n` +
+          (persona ? `VIP PERSONA NOTES (obey): ${persona}\n` : '') +
+          `Then ask a single helpful question, short and natural.`
+        )
+      : (
+          `OPENING STYLE: ${opening}\n` +
+          `Greet normally (no phone numbers). Ask one short helpful question.`
+        );
 
     const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
 
@@ -895,26 +908,28 @@ wss.on('connection', (twilioWS, req) => {
     }));
   }
 
-  function sendHardwiredGreetingIfNeeded() {
-    if (greetedThisCall) return;
-    if (!aiReady) return;
-    if (!streamSid) return; // don't greet before we can deliver audio back to Twilio
+  // ✅ Hardwired greeting that never uses phone number.
+  function sendHardwiredGreetingOnce() {
+    if (!currentCallSid) return;
+    const s = getState(currentCallSid);
+    if (s.greetedOnce) return;
+    s.greetedOnce = true;
 
-    const nameHint = safeName({ callerVip, callerName, callerFrom });
+    const vipFirst = safeVipName(callerVip);
+    const greetLine = callerVip
+      ? `Say exactly one short sentence greeting the caller by name: "Hi ${vipFirst} — it’s Trinity." Then one short question to help them. Do NOT mention any phone number.`
+      : `Say exactly: "Hi — it’s Trinity." Then one short question to help. Do NOT mention any phone number.`;
 
-    // Only hardwire the greeting once per call
-    const greetLine = buildVipGreetingLine(callerVip, nameHint);
+    console.log('Sending hardwired greeting:', { greetLine, vip: callerVip ? callerVip.name : null });
 
-    console.log('Sending hardwired greeting:', { greetLine, vip: callerVip?.name || null });
-
-    greetedThisCall = true;
-    aiWS.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        // forcing the exact first line gets you the “surprise” effect reliably
-        instructions: `Say exactly this as your first spoken line:\n"${greetLine}"`
-      }
-    }));
+    try {
+      aiWS.send(JSON.stringify({
+        type: 'response.create',
+        response: { instructions: greetLine }
+      }));
+    } catch (e) {
+      console.log('Hardwired greeting send failed:', e?.message);
+    }
   }
 
   aiWS.on('open', async () => {
@@ -935,13 +950,11 @@ wss.on('connection', (twilioWS, req) => {
       if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
       return;
     }
-
     try {
       const msg = JSON.parse(raw.toString());
       if (!['response.audio.delta','response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
-
       if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
         if (s?.muteAssistant) return;
         const b64 = msg.delta || msg.audio;
@@ -975,7 +988,6 @@ wss.on('connection', (twilioWS, req) => {
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
-          greetedThisCall = false;
 
           try {
             const params = data.start?.customParameters ?? {};
@@ -998,27 +1010,11 @@ wss.on('connection', (twilioWS, req) => {
             callerFrom = from || callerFrom;
             callerName = callerNameParam || callerName;
 
-            // Resolve VIP immediately now that we have callerFrom
-            if (!latestConfig) latestConfig = await getConfigCached();
-            if (callerFrom && latestConfig?.vips?.length) {
-              const found = resolveVip(callerFrom, latestConfig.vips);
-              if (found) {
-                callerVip = found;
-                console.log('✅ VIP MATCH:', {
-                  name: callerVip.name,
-                  phone: normalizePhone(callerVip.phone),
-                  voice_override: callerVip.voice_override
-                });
-              } else {
-                console.log('VIP: no match for', normalizePhone(callerFrom));
-              }
-            }
-
             if (currentCallSid) {
               const s = getState(currentCallSid);
               s.aiWS = aiWS;
               s.twilioWS = twilioWS;
-              if (callerFrom && !s.meta.from) s.meta.from = callerFrom;
+              if (from && !s.meta.from) s.meta.from = from;
               if (to && !s.meta.to) s.meta.to = to;
               if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
               if (!s.meta.startedAt) s.meta.startedAt = new Date();
@@ -1035,15 +1031,14 @@ wss.on('connection', (twilioWS, req) => {
             console.log('Start handler param parse error:', e?.message);
           }
 
-          // Apply session AFTER we know callerFrom/VIP
           await applySessionConfig('on-start');
 
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
 
-          // Hardwired VIP greeting by name (and spoken normally)
-          sendHardwiredGreetingIfNeeded();
+          // ✅ Send greeting AFTER VIP match + session.update
+          sendHardwiredGreetingOnce();
 
           break;
         }
