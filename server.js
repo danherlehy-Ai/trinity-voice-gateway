@@ -128,14 +128,66 @@ const ENGLISH_GUARD =
 // Normalize anything to digits only
 function normalizePhone(p){ return String(p ?? '').replace(/\D/g, ''); }
 
+/**
+ * Voice selection rules:
+ * - If VIP voice_override is "male" -> use MALE_VOICE (default: alloy)
+ * - If VIP voice_override is "female" -> use DEFAULT_VOICE (default: marin)
+ * - If VIP voice_override is one of the supported voice names -> use it
+ * - Otherwise -> DEFAULT_VOICE (default: marin)
+ *
+ * Supports these names in voice_override (case-insensitive):
+ *   alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+ *
+ * Also tolerates common typos/variants:
+ *   ballard -> ballad
+ */
+const VALID_VOICES = new Set([
+  'alloy','ash','ballad','coral','echo','sage','shimmer','verse','marin','cedar'
+]);
+
+const VOICE_ALIASES = new Map([
+  ['ballard', 'ballad'],
+  ['ballad', 'ballad'],
+  ['marin', 'marin'],
+  ['cedar', 'cedar'],
+  ['alloy', 'alloy'],
+  ['ash', 'ash'],
+  ['coral', 'coral'],
+  ['echo', 'echo'],
+  ['sage', 'sage'],
+  ['shimmer', 'shimmer'],
+  ['verse', 'verse'],
+]);
+
+function resolveVoiceName(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return '';
+  const mapped = VOICE_ALIASES.get(v) || v;
+  return VALID_VOICES.has(mapped) ? mapped : '';
+}
+
 function chooseVoice(defaultVoice, vip) {
-  const male = process.env.MALE_VOICE || 'alloy';
-  const female = defaultVoice || 'marin';
-  if (!vip) return female;
-  const v = (vip?.voice_override || '').toLowerCase();
-  if (v === 'male') return male;
-  if (v === 'marin' || v === 'female') return female;
-  return female;
+  const maleDefault = process.env.MALE_VOICE || 'alloy';
+  const femaleDefault = defaultVoice || 'marin';
+
+  if (!vip) return femaleDefault;
+
+  const rawOverride = (vip?.voice_override || '');
+  const v = String(rawOverride).trim().toLowerCase();
+
+  if (!v) return femaleDefault;
+
+  // Backward-compatible options
+  if (v === 'male') return resolveVoiceName(maleDefault) || maleDefault;
+  if (v === 'female') return femaleDefault;
+
+  // Direct voice name option
+  const resolved = resolveVoiceName(v);
+  if (resolved) return resolved;
+
+  // If someone typed something invalid, keep system stable
+  console.log(`Voice override not recognized ("${rawOverride}") -> using default voice "${femaleDefault}"`);
+  return femaleDefault;
 }
 
 /* === Strict last-4 policy & “no hallucination” rules === */
