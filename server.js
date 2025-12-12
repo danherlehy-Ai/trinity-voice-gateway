@@ -65,7 +65,7 @@ app.post('/stream-status', (req, res) => {
       'streamSid=', b.StreamSid || b.streamSid,
       'callSid=', b.CallSid || b.callSid,
       'startTime=', b.StartTime || b.startTime,
-      'stopReason=', b.StopReason || b.stopReason
+      'stopReason=', b.StopReason || b.stopreason || b.stopReason
     );
   } catch (e) {
     console.log('STREAM STATUS parse error:', e?.message);
@@ -392,7 +392,7 @@ async function downloadTwilioRecording(recordingUrl) {
   const url = String(recordingUrl || '').trim();
   if (!url) throw new Error('Missing RecordingUrl');
 
-  // Twilio RecordingUrl commonly looks like: https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RE... 
+  // Twilio RecordingUrl commonly looks like: https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RE...
   // To get media bytes, Twilio supports appending file extensions like .mp3 or .wav.
   // We'll prefer .mp3 first for easy Telegram playback.
   const candidates = [
@@ -827,8 +827,12 @@ wss.on('connection', (twilioWS, req) => {
 
     const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
 
-    console.log(`Applying session config (${reason}) -> voice=${selectedVoice}` +
-      (callerVip ? `, VIP=${callerVip.name}` : '') + `, instr len=${finalInstructions.length}`);
+    console.log(
+      `Applying session config (${reason}) -> voice=${selectedVoice}` +
+      (callerVip ? `, VIP=${callerVip.name}` : '') +
+      `, instr len=${finalInstructions.length}` +
+      (callerFrom ? `, from=${callerFrom}` : ', from=(missing)')
+    );
 
     aiWS.send(JSON.stringify({
       type: 'session.update',
@@ -895,18 +899,31 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: connected event');
           break;
 
-        case 'start':
+        case 'start': {
           streamSid = data.start?.streamSid;
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
 
+          // ✅ FIX: customParameters is usually an object/map, not an array.
           try {
-            const params = data.start?.customParameters || [];
-            const getP = (n) => (Array.isArray(params) ? params.find(p => p?.name === n) : null)?.value || '';
+            const params = data.start?.customParameters ?? {};
+
+            const getP = (n) => {
+              // Most common: object/map: { from: "...", to: "...", callSid: "...", ... }
+              if (params && typeof params === 'object' && !Array.isArray(params)) return params[n] || '';
+              // Fallback: array of { name, value }
+              if (Array.isArray(params)) return (params.find(p => p?.name === n)?.value) || '';
+              return '';
+            };
+
             const from  = getP('from');
             const to    = getP('to');
             const callerNameParam = getP('callerName');
             const callSid = getP('callSid');
+
+            // Helpful debug (won’t break anything)
+            console.log('Start.customParameters raw =', params);
+            console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid });
 
             currentCallSid = callSid || currentCallSid;
             if (from) console.log('CallerID (From) received:', from);
@@ -930,7 +947,9 @@ wss.on('connection', (twilioWS, req) => {
                 await sendDncDigitsAndMaybeHangup(currentCallSid, 'cnam');
               }
             }
-          } catch {}
+          } catch (e) {
+            console.log('Start handler param parse error:', e?.message);
+          }
 
           await applySessionConfig('on-start');
 
@@ -938,6 +957,7 @@ wss.on('connection', (twilioWS, req) => {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
           break;
+        }
 
         case 'media':
           counters.frames++;
