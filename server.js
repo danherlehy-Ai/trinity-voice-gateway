@@ -129,65 +129,47 @@ const ENGLISH_GUARD =
 function normalizePhone(p){ return String(p ?? '').replace(/\D/g, ''); }
 
 /**
- * Voice selection rules:
- * - If VIP voice_override is "male" -> use MALE_VOICE (default: alloy)
- * - If VIP voice_override is "female" -> use DEFAULT_VOICE (default: marin)
- * - If VIP voice_override is one of the supported voice names -> use it
- * - Otherwise -> DEFAULT_VOICE (default: marin)
+ * IMPORTANT (Realtime Voice):
+ * OpenAI Realtime voice cannot be changed once the model has produced audio in a session.
+ * So we MUST set the correct voice BEFORE we trigger the first spoken greeting.
  *
- * Supports these names in voice_override (case-insensitive):
- *   alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
- *
- * Also tolerates common typos/variants:
- *   ballard -> ballad
+ * Official current voice options (Realtime): alloy, ash, ballad, coral, echo, sage, shimmer, verse
  */
-const VALID_VOICES = new Set([
-  'alloy','ash','ballad','coral','echo','sage','shimmer','verse','marin','cedar'
-]);
+const REALTIME_VOICES = new Set(['alloy','ash','ballad','coral','echo','sage','shimmer','verse']);
 
-const VOICE_ALIASES = new Map([
-  ['ballard', 'ballad'],
-  ['ballad', 'ballad'],
-  ['marin', 'marin'],
-  ['cedar', 'cedar'],
-  ['alloy', 'alloy'],
-  ['ash', 'ash'],
-  ['coral', 'coral'],
-  ['echo', 'echo'],
-  ['sage', 'sage'],
-  ['shimmer', 'shimmer'],
-  ['verse', 'verse'],
-]);
+// Your old habits/labels supported as aliases; these map into REALTIME voices.
+function coerceVoiceName(input, fallbackVoice) {
+  const raw = String(input || '').trim().toLowerCase();
+  if (!raw) return fallbackVoice;
 
-function resolveVoiceName(raw) {
-  const v = String(raw || '').trim().toLowerCase();
-  if (!v) return '';
-  const mapped = VOICE_ALIASES.get(v) || v;
-  return VALID_VOICES.has(mapped) ? mapped : '';
+  // Common aliases
+  if (raw === 'male') return process.env.MALE_VOICE ? String(process.env.MALE_VOICE).toLowerCase() : 'alloy';
+  if (raw === 'female') return fallbackVoice;
+
+  // Let you keep typing "marin" or "cedar" in the sheet without breaking anything:
+  // Realtime does NOT list these as valid options right now, so we treat them as "use fallback".
+  if (raw === 'marin' || raw === 'cedar') return fallbackVoice;
+
+  // If user typed a valid realtime voice (any case), use it.
+  if (REALTIME_VOICES.has(raw)) return raw;
+
+  // If they typed something unknown, fall back.
+  return fallbackVoice;
 }
 
 function chooseVoice(defaultVoice, vip) {
-  const maleDefault = process.env.MALE_VOICE || 'alloy';
-  const femaleDefault = defaultVoice || 'marin';
+  // Default voice must be a valid realtime voice; if not, force echo.
+  const defaultCoerced = REALTIME_VOICES.has(String(defaultVoice || '').toLowerCase())
+    ? String(defaultVoice).toLowerCase()
+    : 'echo';
 
-  if (!vip) return femaleDefault;
+  if (!vip) return defaultCoerced;
 
-  const rawOverride = (vip?.voice_override || '');
-  const v = String(rawOverride).trim().toLowerCase();
+  const desired = coerceVoiceName(vip?.voice_override, defaultCoerced);
 
-  if (!v) return femaleDefault;
-
-  // Backward-compatible options
-  if (v === 'male') return resolveVoiceName(maleDefault) || maleDefault;
-  if (v === 'female') return femaleDefault;
-
-  // Direct voice name option
-  const resolved = resolveVoiceName(v);
-  if (resolved) return resolved;
-
-  // If someone typed something invalid, keep system stable
-  console.log(`Voice override not recognized ("${rawOverride}") -> using default voice "${femaleDefault}"`);
-  return femaleDefault;
+  // If MALE_VOICE env was set to something invalid, still force to a valid one.
+  if (!REALTIME_VOICES.has(desired)) return defaultCoerced;
+  return desired;
 }
 
 /* === Strict last-4 policy & “no hallucination” rules === */
@@ -243,7 +225,9 @@ function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
     lines.push(`[CALL CONTEXT] CallerID_LAST4_VERIFIED: ${last4}.`);
   }
 
-  if (callerVip) lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Use the same last-4 rules.`);
+  if (callerVip) {
+    lines.push(`[CALL CONTEXT] Recognized VIP: ${callerVip.name} (${callerVip.relationship}). Use the same last-4 rules.`);
+  }
 
   return lines.filter(Boolean).join('\n');
 }
@@ -354,7 +338,6 @@ function displayNameAndNumber(name, num){
 const TELEGRAM_TZ = process.env.TELEGRAM_TZ || 'America/New_York';
 function formatLocalDateTime(d = new Date()) {
   try {
-    // Example: Oct 21, 2025 5:36 PM
     return new Intl.DateTimeFormat('en-US', {
       timeZone: TELEGRAM_TZ,
       year: 'numeric',
@@ -444,9 +427,6 @@ async function downloadTwilioRecording(recordingUrl) {
   const url = String(recordingUrl || '').trim();
   if (!url) throw new Error('Missing RecordingUrl');
 
-  // Twilio RecordingUrl commonly looks like: https://api.twilio.com/2010-04-01/Accounts/.../Recordings/RE...
-  // To get media bytes, Twilio supports appending file extensions like .mp3 or .wav.
-  // We'll prefer .mp3 first for easy Telegram playback.
   const candidates = [
     url.endsWith('.mp3') ? url : (url + '.mp3'),
     url.endsWith('.wav') ? url : (url + '.wav'),
@@ -674,6 +654,46 @@ function exitNumberMode(callSid, reason) {
   console.log(`Number-mode: RELEASE (${reason}); collectedDigits=${s.numberMode.digits.length}`);
 }
 
+/* ================= Auto-DNC action ================= */
+async function sendDncDigitsAndMaybeHangup(callSid, reason) {
+  const s = getState(callSid);
+  if (s.dnc.attempted) return;
+  s.dnc.attempted = true;
+  s.dnc.reason = reason;
+
+  console.log(`AUTO-DNC triggered for ${callSid} (${reason})`);
+
+  try {
+    // Stop the AI from speaking (best-effort)
+    try { s.aiWS?.send?.(JSON.stringify({ type: 'response.cancel' })); } catch {}
+    s.muteAssistant = true;
+
+    // Speak a short line (optional)
+    if (s.aiWS && s.aiWS.readyState === 1 && DNC_SAY_LINE) {
+      s.aiWS.send(JSON.stringify({ type: 'response.create', response: { instructions: DNC_SAY_LINE } }));
+      await new Promise(r => setTimeout(r, 900));
+    }
+
+    // Send digits to phone system via Twilio <Play digits="..."> by updating call TwiML
+    const digits = buildDigitsString(AUTO_DNC_DIGITS, AUTO_DNC_GAP_MS);
+    const twiml =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<Response>` +
+        `<Play digits="${digits}"/>` +
+        (DNC_HANGUP_AFTER ? `<Hangup/>` : ``) +
+      `</Response>`;
+
+    const ok = await twilioUpdateCallTwiml(callSid, twiml);
+    console.log('AUTO-DNC TwiML update result:', ok);
+
+    if (!ok && DNC_HANGUP_AFTER) {
+      await hangupCall(callSid);
+    }
+  } catch (e) {
+    console.log('AUTO-DNC error:', e?.message);
+  }
+}
+
 /* ================= /transcripts webhook ================= */
 app.post('/transcripts', async (req, res) => {
   try {
@@ -758,7 +778,6 @@ app.post('/transcripts', async (req, res) => {
         });
       } catch (e) { console.log('Apps Script POST failed:', e?.message); }
 
-      // Telegram header: include date/time, remove To and CallSid
       const when = buf.meta.startedAt || new Date();
       const whenStr = formatLocalDateTime(when);
       const header =
@@ -776,12 +795,8 @@ app.post('/transcripts', async (req, res) => {
   }
 });
 
-/* ================= Twilio Recording Webhook =================
-   Twilio will POST here when a recording is completed (if you point recordingStatusCallback to this URL).
-   We download the recording from Twilio (auth required) and then upload it into Telegram as an audio file.
-*/
+/* ================= Twilio Recording Webhook ================= */
 app.post('/recordings', async (req, res) => {
-  // IMPORTANT: respond fast to Twilio to avoid retries; do work async after 200 OK
   res.status(200).send('ok');
 
   try {
@@ -805,7 +820,6 @@ app.post('/recordings', async (req, res) => {
       return;
     }
 
-    // Download bytes from Twilio (MP3 preferred, WAV fallback)
     const { buffer, ext } = await downloadTwilioRecording(recordingUrl);
 
     const whenStr = formatLocalDateTime(new Date());
@@ -819,7 +833,6 @@ app.post('/recordings', async (req, res) => {
 
     const ok = await sendTelegramAudio(buffer, filename, caption);
     if (!ok) {
-      // Fallback: at least send a message with the Twilio RecordingUrl (will require auth to fetch)
       await sendTelegramMessage(
         caption + `\n\n(Upload to Telegram failed. Twilio Recording URL may require login/auth.)\n${recordingUrl}`
       );
@@ -853,17 +866,27 @@ wss.on('connection', (twilioWS, req) => {
   let aiReady = false;
   let latestConfig = null;
 
+  // Key safety switch:
+  // We do NOT let the AI produce any first greeting until AFTER we have callerFrom and have applied the final voice.
+  let sessionConfigured = false;
+  let greetingSent = false;
+
+  async function findVipByCaller(from, vips) {
+    if (!from || !Array.isArray(vips) || !vips.length) return null;
+    const norm = normalizePhone(from);
+    return vips.find(v => normalizePhone(v.phone) === norm) || null;
+  }
+
   async function applySessionConfig(reason) {
     if (!aiReady) return;
     if (!latestConfig) latestConfig = await getConfigCached();
 
-    if (callerFrom && latestConfig.vips?.length) {
-      const norm = normalizePhone(callerFrom);
-      const found = latestConfig.vips.find(v => normalizePhone(v.phone) === norm);
-      if (found) callerVip = found;
-    }
+    // Identify VIP
+    callerVip = await findVipByCaller(callerFrom, latestConfig.vips);
 
-    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
+    // Pick voice (MUST be done before first audio response)
+    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'echo', callerVip);
+
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
 
     const opening = pickOpening();
@@ -873,9 +896,8 @@ wss.on('connection', (twilioWS, req) => {
       : '';
     const openingDirective =
       `OPENING STYLE: ${opening}\n` +
-      `Start friendly and helpful (e.g., “How can I help today?”). ` +
-      `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Keep it to one sentence. ` +
-      `Vary your phrasing; avoid repeating the exact words. ${vipNotes}`;
+      `Address the caller by name if known (e.g., "Hi ${nameHint}!"). Say their name normally (do not spell it). ` +
+      `Keep it to one sentence. Then ask how you can help. ${vipNotes}`;
 
     const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
 
@@ -896,34 +918,72 @@ wss.on('connection', (twilioWS, req) => {
         instructions: finalInstructions
       }
     }));
+
+    sessionConfigured = true;
+  }
+
+  function sendGreetingNow() {
+    if (!aiReady) return;
+    if (!sessionConfigured) return;
+    if (greetingSent) return;
+
+    // Force a greeting AFTER voice config is set
+    const nameHint = safeName({ callerVip, callerName, callerFrom });
+    const line =
+      callerVip?.name
+        ? `Greet the caller warmly by name: "${nameHint}". One sentence. Then ask how you can help.`
+        : `Give a friendly one-sentence greeting. Then ask how you can help.`;
+
+    aiWS.send(JSON.stringify({
+      type: 'response.create',
+      response: { instructions: line }
+    }));
+
+    greetingSent = true;
+    console.log('Greeting: sent response.create (post-voice-config)');
   }
 
   aiWS.on('open', async () => {
     console.log('AI: connected');
     aiReady = true;
+
+    // Load config early (fine), but DO NOT session.update voice yet.
+    // We wait for Twilio "start" so we can set correct VIP voice BEFORE first audio output.
     latestConfig = await getConfigCached();
-    await applySessionConfig('on-open');
+
+    // If start already happened (rare ordering), apply config now.
+    if (callerFrom || currentCallSid) {
+      await applySessionConfig('on-open-late');
+      sendGreetingNow();
+    }
   });
 
   aiWS.on('message', (raw, isBinary) => {
-    // SAFETY: If Twilio stream not ready yet, don't try to send audio
     if (!streamSid) return;
 
     const s = currentCallSid ? getState(currentCallSid) : null;
 
     if (isBinary) {
-      if (s?.muteAssistant) return; // drop audio while caller reads digits
+      if (s?.muteAssistant) return;
       sendPcm16kBinaryToTwilioAsUlaw(raw, twilioWS, streamSid, counters);
       if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
       return;
     }
+
     try {
       const msg = JSON.parse(raw.toString());
       if (!['response.audio.delta','response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
+
+      // If the AI tries to speak before we configured (shouldn’t happen now), drop audio.
+      if ((msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') && !sessionConfigured) {
+        console.log('AI audio blocked: session not configured yet.');
+        return;
+      }
+
       if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
-        if (s?.muteAssistant) return; // HARD MUTE during number recitation
+        if (s?.muteAssistant) return;
         const b64 = msg.delta || msg.audio;
         if (b64) {
           chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
@@ -956,14 +1016,11 @@ wss.on('connection', (twilioWS, req) => {
           console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
           counters.frames = 0; counters.sentChunks = 0;
 
-          // ✅ FIX: customParameters is usually an object/map, not an array.
           try {
             const params = data.start?.customParameters ?? {};
 
             const getP = (n) => {
-              // Most common: object/map: { from: "...", to: "...", callSid: "...", ... }
               if (params && typeof params === 'object' && !Array.isArray(params)) return params[n] || '';
-              // Fallback: array of { name, value }
               if (Array.isArray(params)) return (params.find(p => p?.name === n)?.value) || '';
               return '';
             };
@@ -973,13 +1030,11 @@ wss.on('connection', (twilioWS, req) => {
             const callerNameParam = getP('callerName');
             const callSid = getP('callSid');
 
-            // Helpful debug (won’t break anything)
             console.log('Start.customParameters raw =', params);
             console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid });
 
             currentCallSid = callSid || currentCallSid;
-            if (from) console.log('CallerID (From) received:', from);
-            callerFrom = from;
+            callerFrom = from || callerFrom;
             callerName = callerNameParam || callerName;
 
             if (currentCallSid) {
@@ -989,25 +1044,32 @@ wss.on('connection', (twilioWS, req) => {
               if (from && !s.meta.from) s.meta.from = from;
               if (to && !s.meta.to) s.meta.to = to;
               if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
-              if (!s.meta.startedAt) s.meta.startedAt = new Date(); // earliest start mark
+              if (!s.meta.startedAt) s.meta.startedAt = new Date();
               resetIdleTimer(currentCallSid);
-            }
 
-            if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
-              const s = getState(currentCallSid);
-              if (isCnamSpam(s.meta.callerName)) {
-                await sendDncDigitsAndMaybeHangup(currentCallSid, 'cnam');
+              // Optional CNAM spam auto-DNC (unchanged)
+              if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
+                if (isCnamSpam(s.meta.callerName)) {
+                  await sendDncDigitsAndMaybeHangup(currentCallSid, 'cnam');
+                }
               }
             }
           } catch (e) {
             console.log('Start handler param parse error:', e?.message);
           }
 
-          await applySessionConfig('on-start');
-
-          if (aiWS.readyState === 1) {
-            aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+          // NOW (and only now) configure the session voice + instructions, then send greeting.
+          if (aiReady) {
+            await applySessionConfig('on-start');
+            if (aiWS.readyState === 1) {
+              aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+            }
+            sendGreetingNow();
+          } else {
+            // AI not ready yet; config will be applied in aiWS.on('open') once ready
+            console.log('AI not ready at start; will apply config on-open-late.');
           }
+
           break;
         }
 
