@@ -582,7 +582,11 @@ function getState(callSid) {
       dnc: { attempted: false, reason: '' },
       numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
       muteAssistant: false,
-      greetedOnce: false
+      greetedOnce: false,
+
+      // ✅ BARGE-IN: runtime flags (not prompt)
+      bargeIn: { active: false, lastAt: 0 },
+      aiSpeaking: false
     });
   }
   return transcripts.get(callSid);
@@ -660,7 +664,10 @@ function exitNumberMode(callSid, reason) {
   const s = getState(callSid);
   if (!s.numberMode.active) return;
   s.numberMode.active = false;
-  s.muteAssistant = false;
+
+  // Only unmute if not actively barged-in
+  if (!s.bargeIn.active) s.muteAssistant = false;
+
   if (s.numberMode.timer) { clearTimeout(s.numberMode.timer); s.numberMode.timer = null; }
   console.log(`Number-mode: RELEASE (${reason}); collectedDigits=${s.numberMode.digits.length}`);
 }
@@ -851,6 +858,19 @@ wss.on('connection', (twilioWS, req) => {
   let currentCallSid = null;
   const counters = { frames: 0, sentChunks: 0 };
 
+  // ✅ BARGE-IN: Twilio clear helper
+  function twilioClearBufferedAudio() {
+    try {
+      if (!streamSid) return;
+      if (!twilioWS || twilioWS.readyState !== 1) return;
+      // Twilio Media Streams: "clear" event flushes buffered audio on call :contentReference[oaicite:4]{index=4}
+      twilioWS.send(JSON.stringify({ event: 'clear', streamSid }));
+      console.log('BARGE-IN: Sent Twilio clear (flush buffered outbound audio)');
+    } catch (e) {
+      console.log('BARGE-IN: Twilio clear failed:', e?.message);
+    }
+  }
+
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const OPENAI_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
   const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
@@ -869,11 +889,8 @@ wss.on('connection', (twilioWS, req) => {
   async function applySessionConfig(reason, { forceFresh = false } = {}) {
     if (!aiReady) return;
 
-    // ✅ If you want “near immediate but not every time”, keep forceFresh=false
-    // We’ll forceFresh on START only (see below) but it will still respect TTL.
     latestConfig = await getConfigCached({ forceFresh });
 
-    // VIP match uses last-10 digits
     callerVip = matchVipByLast10(latestConfig.vips, callerFrom);
     if (!callerVip) {
       console.log('VIP: no match for', normalizeLast10(callerFrom));
@@ -890,7 +907,6 @@ wss.on('connection', (twilioWS, req) => {
     const persona = String(callerVip?.persona_notes || '').trim();
     const vibe = safeVipVibe(callerVip);
 
-    // ✅ Stronger “VIP MODE” block so it actually sticks
     const vipModeBlock = callerVip
       ? (
           `\n[V.I.P. MODE — MUST FOLLOW]\n` +
@@ -936,7 +952,6 @@ wss.on('connection', (twilioWS, req) => {
     }));
   }
 
-  // ✅ Hardwired greeting that never uses phone number.
   function sendHardwiredGreetingOnce() {
     if (!currentCallSid) return;
     const s = getState(currentCallSid);
@@ -945,7 +960,6 @@ wss.on('connection', (twilioWS, req) => {
 
     const vipFirst = safeVipName(callerVip);
 
-    // IMPORTANT: even in this “hardwired” instruction, we never include phone digits.
     const greetLine = callerVip
       ? `Say exactly: "Hi ${vipFirst} — it’s Trinity. How can I help today?"`
       : `Say exactly: "Hi — it’s Trinity. How can I help today?"`;
@@ -960,6 +974,52 @@ wss.on('connection', (twilioWS, req) => {
     } catch (e) {
       console.log('Hardwired greeting send failed:', e?.message);
     }
+  }
+
+  // ✅ BARGE-IN: cancel/clear helper (OpenAI + Twilio + local mute)
+  function handleBargeInStart(reason = 'speech_started') {
+    if (!currentCallSid) return;
+    const s = getState(currentCallSid);
+
+    // Avoid spamming cancels
+    const now = Date.now();
+    if (s.bargeIn.active && (now - (s.bargeIn.lastAt || 0) < 250)) return;
+
+    s.bargeIn.active = true;
+    s.bargeIn.lastAt = now;
+
+    // Immediately mute sending assistant audio deltas
+    s.muteAssistant = true;
+
+    // Flush any audio already buffered on Twilio’s side
+    twilioClearBufferedAudio();
+
+    // Cancel the active response & clear output audio buffer (best practice: cancel then clear)
+    try {
+      if (aiWS.readyState === 1) {
+        aiWS.send(JSON.stringify({ type: 'response.cancel' }));
+        aiWS.send(JSON.stringify({ type: 'output_audio_buffer.clear' }));
+      }
+      console.log('BARGE-IN: response.cancel + output_audio_buffer.clear sent to OpenAI', { reason });
+    } catch (e) {
+      console.log('BARGE-IN: OpenAI cancel/clear failed:', e?.message);
+    }
+  }
+
+  function handleBargeInStop(reason = 'speech_stopped') {
+    if (!currentCallSid) return;
+    const s = getState(currentCallSid);
+
+    s.bargeIn.active = false;
+
+    // Small delay helps prevent assistant from stepping on the last syllable
+    setTimeout(() => {
+      const s2 = getState(currentCallSid);
+      if (s2.numberMode.active) return;     // number-mode still owns silence/mute
+      if (s2.bargeIn.active) return;        // barged-in again
+      s2.muteAssistant = false;
+      console.log('BARGE-IN: released mute', { reason });
+    }, 200);
   }
 
   aiWS.on('open', async () => {
@@ -980,18 +1040,42 @@ wss.on('connection', (twilioWS, req) => {
       if (currentCallSid) bumpActivity(currentCallSid, 'ai-binary');
       return;
     }
+
     try {
       const msg = JSON.parse(raw.toString());
+
+      // ✅ BARGE-IN: OpenAI server tells us when caller speech starts/stops in VAD mode
+      // input_audio_buffer.speech_started triggers when user interrupts :contentReference[oaicite:5]{index=5}
+      if (msg?.type === 'input_audio_buffer.speech_started') {
+        handleBargeInStart('input_audio_buffer.speech_started');
+        if (currentCallSid) bumpActivity(currentCallSid, 'speech_started');
+        return;
+      }
+      if (msg?.type === 'input_audio_buffer.speech_stopped') {
+        handleBargeInStop('input_audio_buffer.speech_stopped');
+        if (currentCallSid) bumpActivity(currentCallSid, 'speech_stopped');
+        return;
+      }
+
+      // (optional) helpful logs
       if (!['response.audio.delta','response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
+
       if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
+        if (s) s.aiSpeaking = true;
         if (s?.muteAssistant) return;
+
         const b64 = msg.delta || msg.audio;
         if (b64) {
           chunkAndSendUlawBase64ToTwilio(b64, twilioWS, streamSid, counters);
           if (currentCallSid) bumpActivity(currentCallSid, 'ai-delta');
         }
+      } else if (msg.type === 'response.done' || msg.type === 'response.completed') {
+        if (s) s.aiSpeaking = false;
+      } else if (msg.type === 'output_audio_buffer.cleared') {
+        // Server emits this when output audio buffer is cleared (e.g., barge-in) :contentReference[oaicite:6]{index=6}
+        console.log('AI: output_audio_buffer.cleared');
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
       }
@@ -1061,17 +1145,13 @@ wss.on('connection', (twilioWS, req) => {
             console.log('Start handler param parse error:', e?.message);
           }
 
-          // ✅ On start, forceFresh=true is SAFE because TTL is short (20s) and fetch is tiny.
-          // If you want *never* force refresh, change true -> false.
           await applySessionConfig('on-start', { forceFresh: true });
 
           if (aiWS.readyState === 1) {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
 
-          // ✅ Send greeting AFTER VIP match + session.update
           sendHardwiredGreetingOnce();
-
           break;
         }
 
