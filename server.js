@@ -81,7 +81,7 @@ const CONFIG_URL =
 
 let _configCache = { when: 0, data: null };
 
-// ✅ CHANGED: default cache 20 seconds (env override supported)
+// ✅ default cache 20 seconds (env override supported)
 const CONFIG_TTL_MS = Math.max(1000, Number(process.env.CONFIG_TTL_MS || 20000));
 
 async function fetchConfigFresh() {
@@ -90,14 +90,13 @@ async function fetchConfigFresh() {
 
   const res = await fetch(url, {
     method: 'GET',
-    headers: {
-      'Cache-Control': 'no-store'
-    }
+    headers: { 'Cache-Control': 'no-store' }
   });
 
   if (!res.ok) throw new Error(`Config HTTP ${res.status}`);
   const json = await res.json();
   if (!json?.ok) throw new Error(`Config error: ${JSON.stringify(json)}`);
+
   const system_prompt = String(json.system_prompt || '');
   const vips = Array.isArray(json.vips) ? json.vips : [];
   const businesses = Array.isArray(json.businesses) ? json.businesses : [];
@@ -105,7 +104,6 @@ async function fetchConfigFresh() {
   return { system_prompt, vips, businesses };
 }
 
-// ✅ CHANGED: optional forceFresh
 async function getConfigCached({ forceFresh = false } = {}) {
   const now = Date.now();
   if (!forceFresh && _configCache.data && now - _configCache.when < CONFIG_TTL_MS) return _configCache.data;
@@ -172,6 +170,23 @@ function chooseVoice(defaultVoice, vip) {
   return safeDefault;
 }
 
+// Returns true ONLY if VIP explicitly set a usable override (named voice OR male/female)
+function hasVipVoiceOverride(vip) {
+  const raw = String(vip?.voice_override || '').trim().toLowerCase();
+  if (!raw) return false;
+  if (raw === 'male' || raw === 'female') return true;
+  return ALLOWED_VOICES.has(raw);
+}
+
+// Display name for announcing voice (Ballad, Sage, etc.)
+function displayVoiceName(voice) {
+  const v = String(voice || '').trim();
+  if (!v) return 'Trinity';
+  const lower = v.toLowerCase();
+  // Title-case the voice name
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
 /* === Strict last-4 policy & “no hallucination” rules === */
 const DIGIT_PAUSE_POLICY =
   'WHEN CALLER RECITES DIGITS (like a phone number or code), DO NOT INTERRUPT. ' +
@@ -200,7 +215,7 @@ function safeVipName(vip){
   return n.split(/\s+/)[0]; // first name token
 }
 
-// ✅ optional “tone/vibe” column support
+// optional “tone/vibe” column support
 function safeVipVibe(vip){
   const v = String(vip?.vibe || vip?.tone || '').trim();
   return v;
@@ -258,16 +273,36 @@ function pickOpening() {
 }
 
 /* ================= Greeting filter ================= */
-const GREETING_PREFIXES = [
-  "Hi, this is Trinity, Dan Herlihy's A.I. assistant",
-  "Hi, this is Trinity, Dan Hurley AI assistant",
-  "Hi, this is Trinity, Dan Herlihy AI assistant",
-  "Hi this is Trinity, Dan Herlihy",
-];
+function normalizeGreetingText(s) {
+  return String(s || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[’‘`]/g, "'")
+    .replace(/\s+/g, ' ');
+}
+
 function isGreeting(line) {
-  const lower = (line || '').toLowerCase();
-  return GREETING_PREFIXES.some(p => lower.startsWith(p.toLowerCase())) ||
-         (lower.includes('this is trinity') && lower.includes('assistant'));
+  const t = normalizeGreetingText(line);
+
+  // Trinity variants (old + new)
+  if (t.includes("this is trinity")) return true;
+  if (t.includes("it's trinity")) return true;
+  if (t.includes("dan herlihy") && t.includes("ai") && t.includes("assistant")) return true;
+
+  // New “Dan hasn’t picked up yet” intros
+  if (t.includes("dan hasn't picked up") && (t.includes("it's trinity") || t.includes("this is trinity"))) return true;
+
+  // VIP Assistant intros (any voice name)
+  if (t.includes("dan hasn't picked up") && t.includes("vip assistant")) return true;
+
+  // Legacy prefixes you had
+  const LEGACY_PREFIXES = [
+    "hi, this is trinity, dan herlihy's a.i. assistant",
+    "hi, this is trinity, dan hurley ai assistant",
+    "hi, this is trinity, dan herlihy ai assistant",
+    "hi this is trinity, dan herlihy",
+  ];
+  return LEGACY_PREFIXES.some(p => t.startsWith(p));
 }
 
 /* ============== Transcript store + idle + DNC + number-mode state ============== */
@@ -582,9 +617,15 @@ function getState(callSid) {
       dnc: { attempted: false, reason: '' },
       numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
       muteAssistant: false,
-      greetedOnce: false,
 
-      // ✅ BARGE-IN: runtime flags (not prompt)
+      // Greeting gating
+      greetedOnce: false,
+      greetingPending: false,
+      greetingTimer: null,
+      aiSessionReady: false,
+      selectedVoice: 'marin',
+
+      // BARGE-IN: runtime flags (not prompt)
       bargeIn: { active: false, lastAt: 0 },
       aiSpeaking: false
     });
@@ -858,12 +899,14 @@ wss.on('connection', (twilioWS, req) => {
   let currentCallSid = null;
   const counters = { frames: 0, sentChunks: 0 };
 
-  // ✅ BARGE-IN: Twilio clear helper
+  // Greeting context (per-connection)
+  let selectedVoice = 'marin';
+
+  // Twilio clear helper (barge-in)
   function twilioClearBufferedAudio() {
     try {
       if (!streamSid) return;
       if (!twilioWS || twilioWS.readyState !== 1) return;
-      // Twilio Media Streams: "clear" event flushes buffered audio on call :contentReference[oaicite:4]{index=4}
       twilioWS.send(JSON.stringify({ event: 'clear', streamSid }));
       console.log('BARGE-IN: Sent Twilio clear (flush buffered outbound audio)');
     } catch (e) {
@@ -898,7 +941,13 @@ wss.on('connection', (twilioWS, req) => {
       console.log('VIP: matched', { name: callerVip.name, phone: normalizeLast10(callerVip.phone), from: normalizeLast10(callerFrom) });
     }
 
-    const selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
+    selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
+
+    // Store on call state if available
+    if (currentCallSid) {
+      const s = getState(currentCallSid);
+      s.selectedVoice = selectedVoice;
+    }
 
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
     const opening = pickOpening();
@@ -952,36 +1001,75 @@ wss.on('connection', (twilioWS, req) => {
     }));
   }
 
-  function sendHardwiredGreetingOnce() {
+  // Greeting scheduling: we want “no dead air” but also “no speak until session is truly ready”.
+  function scheduleGreetingAttempt() {
+    if (!currentCallSid) return;
+    const s = getState(currentCallSid);
+
+    s.greetingPending = true;
+
+    // safety: clear existing timer
+    if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
+
+    // fallback attempt after 6s (still gated by aiSessionReady)
+    s.greetingTimer = setTimeout(() => trySendGreetingNow('fallback-timeout'), 6000);
+
+    // immediate attempt (if already ready)
+    trySendGreetingNow('schedule');
+  }
+
+  function trySendGreetingNow(reason = 'ai-ready') {
     if (!currentCallSid) return;
     const s = getState(currentCallSid);
     if (s.greetedOnce) return;
+    if (!s.greetingPending) return;
+    if (!s.aiSessionReady) return; // <- critical gating
+
     s.greetedOnce = true;
+    s.greetingPending = false;
+    if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
 
     const vipFirst = safeVipName(callerVip);
+    const voiceName = displayVoiceName(s.selectedVoice || selectedVoice);
 
-    const greetLine = callerVip
-      ? `Say exactly: "Hi ${vipFirst} — it’s Trinity. How can I help today?"`
-      : `Say exactly: "Hi — it’s Trinity. How can I help today?"`;
+    // ALWAYS default to Trinity when unclear/missing override
+    let greetLine;
+    if (callerVip && hasVipVoiceOverride(callerVip)) {
+      // VIP with explicit override => announce voice name
+      greetLine = vipFirst
+        ? `Hi ${vipFirst} — This is ${voiceName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
+        : `Hi — This is ${voiceName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`;
+    } else if (callerVip && vipFirst) {
+      // VIP recognized, but no usable override => Trinity (personalized)
+      greetLine = `Hi ${vipFirst} — it's Trinity. Dan hasn't picked up yet. How can I help?`;
+    } else {
+      // Anything else => Trinity
+      greetLine = `Hi — it's Trinity. Dan hasn't picked up yet. How can I help?`;
+    }
 
-    console.log('Sending hardwired greeting:', { greetLine, vip: callerVip ? callerVip.name : null });
+    console.log('GREETING: sending (post-session-ready):', {
+      reason,
+      vip: callerVip ? callerVip.name : null,
+      hasOverride: callerVip ? hasVipVoiceOverride(callerVip) : false,
+      selectedVoice: s.selectedVoice || selectedVoice,
+      greetLine
+    });
 
     try {
       aiWS.send(JSON.stringify({
         type: 'response.create',
-        response: { instructions: greetLine }
+        response: { instructions: `Say exactly: "${greetLine}"` }
       }));
     } catch (e) {
-      console.log('Hardwired greeting send failed:', e?.message);
+      console.log('GREETING: send failed:', e?.message);
     }
   }
 
-  // ✅ BARGE-IN: cancel/clear helper (OpenAI + Twilio + local mute)
+  // BARGE-IN: cancel/clear helper (OpenAI + Twilio + local mute)
   function handleBargeInStart(reason = 'speech_started') {
     if (!currentCallSid) return;
     const s = getState(currentCallSid);
 
-    // Avoid spamming cancels
     const now = Date.now();
     if (s.bargeIn.active && (now - (s.bargeIn.lastAt || 0) < 250)) return;
 
@@ -994,7 +1082,7 @@ wss.on('connection', (twilioWS, req) => {
     // Flush any audio already buffered on Twilio’s side
     twilioClearBufferedAudio();
 
-    // Cancel the active response & clear output audio buffer (best practice: cancel then clear)
+    // Cancel active response & clear output audio buffer
     try {
       if (aiWS.readyState === 1) {
         aiWS.send(JSON.stringify({ type: 'response.cancel' }));
@@ -1012,11 +1100,10 @@ wss.on('connection', (twilioWS, req) => {
 
     s.bargeIn.active = false;
 
-    // Small delay helps prevent assistant from stepping on the last syllable
     setTimeout(() => {
       const s2 = getState(currentCallSid);
-      if (s2.numberMode.active) return;     // number-mode still owns silence/mute
-      if (s2.bargeIn.active) return;        // barged-in again
+      if (s2.numberMode.active) return;
+      if (s2.bargeIn.active) return;
       s2.muteAssistant = false;
       console.log('BARGE-IN: released mute', { reason });
     }, 200);
@@ -1044,8 +1131,18 @@ wss.on('connection', (twilioWS, req) => {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // ✅ BARGE-IN: OpenAI server tells us when caller speech starts/stops in VAD mode
-      // input_audio_buffer.speech_started triggers when user interrupts :contentReference[oaicite:5]{index=5}
+      // Greeting readiness: wait for session.updated
+      if (msg?.type === 'session.updated') {
+        if (currentCallSid) {
+          const st = getState(currentCallSid);
+          st.aiSessionReady = true;
+          console.log('AI: session.updated => aiSessionReady=true');
+          trySendGreetingNow('session.updated');
+        }
+        // do not return; allow other logging below if needed
+      }
+
+      // BARGE-IN events
       if (msg?.type === 'input_audio_buffer.speech_started') {
         handleBargeInStart('input_audio_buffer.speech_started');
         if (currentCallSid) bumpActivity(currentCallSid, 'speech_started');
@@ -1057,7 +1154,6 @@ wss.on('connection', (twilioWS, req) => {
         return;
       }
 
-      // (optional) helpful logs
       if (!['response.audio.delta','response.output_audio.delta'].includes(msg?.type)) {
         console.log('AI event:', msg?.type);
       }
@@ -1074,7 +1170,6 @@ wss.on('connection', (twilioWS, req) => {
       } else if (msg.type === 'response.done' || msg.type === 'response.completed') {
         if (s) s.aiSpeaking = false;
       } else if (msg.type === 'output_audio_buffer.cleared') {
-        // Server emits this when output audio buffer is cleared (e.g., barge-in) :contentReference[oaicite:6]{index=6}
         console.log('AI: output_audio_buffer.cleared');
       } else if (msg.type === 'error') {
         console.log('AI error:', msg.error || msg);
@@ -1133,6 +1228,12 @@ wss.on('connection', (twilioWS, req) => {
               if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
               if (!s.meta.startedAt) s.meta.startedAt = new Date();
               resetIdleTimer(currentCallSid);
+
+              // reset greeting readiness for this call
+              s.aiSessionReady = false;
+              s.greetedOnce = false;
+              s.greetingPending = false;
+              if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
             }
 
             if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
@@ -1151,7 +1252,8 @@ wss.on('connection', (twilioWS, req) => {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
 
-          sendHardwiredGreetingOnce();
+          // Schedule greeting AFTER on-start config; it will speak only after session.updated
+          scheduleGreetingAttempt();
           break;
         }
 
