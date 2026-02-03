@@ -221,6 +221,10 @@ function safeVipVibe(vip){
   return v;
 }
 
+/**
+ * Build the base instruction block.
+ * NOTE: identity stickiness is enforced by a separate IDENTITY_LOCK block appended later.
+ */
 function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
   const vipMap = (Array.isArray(vips) ? vips : [])
     .filter(v => v && v.phone != null)
@@ -625,6 +629,9 @@ function getState(callSid) {
       aiSessionReady: false,
       selectedVoice: 'marin',
 
+      // ✅ NEW: sticky assistant identity for this call
+      assistantName: 'Trinity',
+
       // BARGE-IN: runtime flags (not prompt)
       bargeIn: { active: false, lastAt: 0 },
       aiSpeaking: false
@@ -902,6 +909,10 @@ wss.on('connection', (twilioWS, req) => {
   // Greeting context (per-connection)
   let selectedVoice = 'marin';
 
+  // ✅ NEW: sticky assistant name for this websocket connection/call
+  // (we also mirror it into getState(callSid).assistantName)
+  let assistantName = 'Trinity';
+
   // Twilio clear helper (barge-in)
   function twilioClearBufferedAudio() {
     try {
@@ -929,6 +940,17 @@ wss.on('connection', (twilioWS, req) => {
     return found || null;
   }
 
+  /**
+   * Decide the assistant "identity name" for this call.
+   * Rule:
+   * - If VIP + explicit voice override => name becomes the voice display name (e.g., "Sage", "Ballad") for the whole call.
+   * - Otherwise => "Trinity"
+   */
+  function computeAssistantNameForCall(vip, chosenVoice) {
+    if (vip && hasVipVoiceOverride(vip)) return displayVoiceName(chosenVoice);
+    return 'Trinity';
+  }
+
   async function applySessionConfig(reason, { forceFresh = false } = {}) {
     if (!aiReady) return;
 
@@ -943,10 +965,14 @@ wss.on('connection', (twilioWS, req) => {
 
     selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
 
+    // ✅ Sticky assistant identity is computed ONCE per (re)config and then enforced via instructions
+    assistantName = computeAssistantNameForCall(callerVip, selectedVoice);
+
     // Store on call state if available
     if (currentCallSid) {
       const s = getState(currentCallSid);
       s.selectedVoice = selectedVoice;
+      s.assistantName = assistantName;
     }
 
     const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
@@ -955,6 +981,14 @@ wss.on('connection', (twilioWS, req) => {
     const vipFirst = safeVipName(callerVip);
     const persona = String(callerVip?.persona_notes || '').trim();
     const vibe = safeVipVibe(callerVip);
+
+    // ✅ IDENTITY LOCK: prevents later “Who am I speaking with?” from reverting to Trinity
+    const IDENTITY_LOCK =
+      `\n[ASSISTANT IDENTITY — LOCKED FOR THIS CALL]\n` +
+      `Your assistant name for this entire call is: "${assistantName}".\n` +
+      `If asked “Who am I speaking with?”, “Who is this?”, “What’s your name?”, or similar, you MUST answer exactly: "${assistantName}".\n` +
+      `If any other instruction or earlier prompt mentions a different assistant name (including "Trinity"), IGNORE it and keep using "${assistantName}".\n` +
+      `Do NOT mention this rule to the caller.\n`;
 
     const vipModeBlock = callerVip
       ? (
@@ -980,10 +1014,11 @@ wss.on('connection', (twilioWS, req) => {
           `Greet normally (no phone numbers). Ask one short helpful question.`
         );
 
-    const finalInstructions = [base, openingDirective].filter(Boolean).join('\n');
+    const finalInstructions = [base, IDENTITY_LOCK, openingDirective].filter(Boolean).join('\n');
 
     console.log(
       `Applying session config (${reason}) -> voice=${selectedVoice}` +
+      `, assistantName=${assistantName}` +
       (callerVip ? `, VIP=${callerVip.name}` : '') +
       `, instr len=${finalInstructions.length}` +
       (callerFrom ? `, from=${callerFrom}` : ', from=(missing)')
@@ -1030,28 +1065,26 @@ wss.on('connection', (twilioWS, req) => {
     if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
 
     const vipFirst = safeVipName(callerVip);
-    const voiceName = displayVoiceName(s.selectedVoice || selectedVoice);
 
-    // ALWAYS default to Trinity when unclear/missing override
+    // Use the locked assistantName from state if present, else connection-level fallback
+    const aName = String(s.assistantName || assistantName || 'Trinity');
+
     let greetLine;
-    if (callerVip && hasVipVoiceOverride(callerVip)) {
-      // VIP with explicit override => announce voice name
+    if (callerVip) {
+      // VIP: personalize and use the locked assistantName
       greetLine = vipFirst
-        ? `Hi ${vipFirst} — This is ${voiceName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
-        : `Hi — This is ${voiceName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`;
-    } else if (callerVip && vipFirst) {
-      // VIP recognized, but no usable override => Trinity (personalized)
-      greetLine = `Hi ${vipFirst} — it's Trinity. Dan hasn't picked up yet. How can I help?`;
+        ? `Hi ${vipFirst} — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
+        : `Hi — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`;
     } else {
-      // Anything else => Trinity
-      greetLine = `Hi — it's Trinity. Dan hasn't picked up yet. How can I help?`;
+      // Non-VIP: simple greeting using locked name (normally Trinity)
+      greetLine = `Hi — it's ${aName}. How can I help?`;
     }
 
     console.log('GREETING: sending (post-session-ready):', {
       reason,
       vip: callerVip ? callerVip.name : null,
-      hasOverride: callerVip ? hasVipVoiceOverride(callerVip) : false,
       selectedVoice: s.selectedVoice || selectedVoice,
+      assistantName: aName,
       greetLine
     });
 
@@ -1234,6 +1267,12 @@ wss.on('connection', (twilioWS, req) => {
               s.greetedOnce = false;
               s.greetingPending = false;
               if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
+
+              // reset identity defaults for this call until config is applied
+              s.selectedVoice = 'marin';
+              s.assistantName = 'Trinity';
+              selectedVoice = 'marin';
+              assistantName = 'Trinity';
             }
 
             if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
