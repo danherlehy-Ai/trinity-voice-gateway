@@ -417,35 +417,142 @@ const IDLE_HANGUP_SECS = Math.max(1, Number(process.env.IDLE_HANGUP_SECS || 180)
 const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowerCase() === 'true';
 const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
 
-/* ================= Auto-DNC env & helpers ================= */
+/* ================= Auto-Press (DNC/opt-out) env & helpers ================= */
+/**
+ * Goal:
+ * - Detect robocalls that say "Press X to be removed / opt out / unsubscribe / do-not-call"
+ * - Automatically press the detected digit (0-9) only if confidence >= threshold (default 0.90)
+ * - Rate-limit per caller+digit to avoid repeated actions
+ */
 const AUTO_DNC_ENABLE       = String(process.env.AUTO_DNC_ENABLE || 'true').toLowerCase() === 'true';
 const AUTO_DNC_ON_CNAM      = String(process.env.AUTO_DNC_ON_CNAM || 'true').toLowerCase() === 'true';
 const AUTO_DNC_ONLY_PHRASE  = String(process.env.AUTO_DNC_ONLY_ON_PHRASE || 'false').toLowerCase() === 'true';
+
+// Back-compat: default digits to press when we CANNOT extract a specific digit (e.g., CNAM spam)
 const AUTO_DNC_DIGITS       = (process.env.AUTO_DNC_DIGITS || '9,8').split(',').map(s => s.trim()).filter(Boolean);
+
 const AUTO_DNC_GAP_MS       = Math.max(0, Number(process.env.AUTO_DNC_GAP_MS || 250));
 const DNC_HANGUP_AFTER      = String(process.env.DNC_HANGUP_AFTER || 'true').toLowerCase() === 'true';
 const DNC_SAY_LINE          = process.env.DNC_SAY_LINE || 'Please remove this number from your call list. Thank you.';
 
-const DNC_PHRASES = [
-  /press\s*(9|nine)\b.*(remove|do\s*not\s*call|opt[-\s]*out|unsubscribe|do\s*not\s*contact)/i,
-  /(to|please)\s*(be\s*)?(removed|remove\s*me)\b.*(list|database|call)/i,
-  /\bopt[-\s]*out\b/i,
-  /\bdo\s*not\s*call\b/i,
-  /\bunsubscribe\b/i,
-  /to\s*be\s*removed\b/i
+// ✅ NEW: confidence threshold (requested 0.90 default)
+const AUTO_PRESS_CONFIDENCE = Math.max(0, Math.min(1, Number(process.env.AUTO_PRESS_CONFIDENCE || 0.90)));
+
+// ✅ NEW: rate limit window (seconds)
+const AUTO_PRESS_RATE_LIMIT_SECS = Math.max(60, Number(process.env.AUTO_PRESS_RATE_LIMIT_SECS || 6 * 60 * 60)); // default 6 hours
+const pressRateLimit = new Map(); // key -> timestamp
+
+// Word to digit for spoken numbers 0–9
+const PRESS_WORD_TO_DIGIT = {
+  'zero':'0','oh':'0','o':'0',
+  'one':'1','two':'2','three':'3','four':'4','for':'4','five':'5',
+  'six':'6','seven':'7','eight':'8','nine':'9'
+};
+
+// Core “removal intent” terms
+const REMOVAL_KEYWORDS = [
+  'remove', 'removed', 'do not call', 'donotcall', 'dnc',
+  'opt out', 'optout', 'unsubscribe', 'stop calling', 'stop contact',
+  'call list', 'mailing list', 'marketing list', 'contact list'
 ];
-function isRemovalPhrase(text='') {
-  const t = String(text || '');
-  return DNC_PHRASES.some(rx => rx.test(t));
-}
+
+// Strong phrases (these boost confidence)
+const STRONG_REMOVAL_PATTERNS = [
+  /\bpress\s+(?:\d|zero|one|two|three|four|five|six|seven|eight|nine)\b.*\b(to\s*)?(?:be\s*)?(removed|opt\s*out|unsubscribe|stop|do\s*not\s*call)\b/i,
+  /\b(?:to|please)\s*(?:be\s*)?(removed|opt\s*out|unsubscribe)\b/i,
+  /\bdo\s*not\s*call\b/i,
+  /\bopt[-\s]*out\b/i,
+  /\bunsubscribe\b/i
+];
+
 function isCnamSpam(name='') {
   const t = String(name || '').toLowerCase();
   return /spam|scam/.test(t);
 }
+
 function buildDigitsString(digitsArr, gapMs) {
   const waits = Math.max(1, Math.round(gapMs / 500));
   const sep = 'w'.repeat(waits);
   return digitsArr.join(sep);
+}
+
+/**
+ * Extract a single 0–9 digit from "press X" style text.
+ * Supports: "press 9", "press nine", "dial 2", "hit zero", "enter 1"
+ */
+function extractPressDigit(text = '') {
+  const t = String(text || '').toLowerCase();
+
+  // numeric form
+  let m = t.match(/\b(press|dial|hit|enter|push|tap)\s*([0-9])\b/i);
+  if (m && m[2] != null) return String(m[2]);
+
+  // word form
+  m = t.match(/\b(press|dial|hit|enter|push|tap)\s*(zero|oh|o|one|two|three|four|for|five|six|seven|eight|nine)\b/i);
+  if (m && m[2]) return PRESS_WORD_TO_DIGIT[m[2]] || null;
+
+  return null;
+}
+
+function hasRemovalIntent(text='') {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  for (const rx of STRONG_REMOVAL_PATTERNS) {
+    if (rx.test(t)) return true;
+  }
+  for (const kw of REMOVAL_KEYWORDS) {
+    if (t.includes(kw)) return true;
+  }
+  return false;
+}
+
+/**
+ * AI-like confidence scoring (deterministic, no extra API calls):
+ * - Strong "press X to be removed/opt out/unsubscribe" => 0.97
+ * - "press X" + any removal intent => 0.92–0.95
+ * - CNAM says spam/scam + press X => 0.90
+ * - Otherwise low confidence
+ */
+function inferAutoPressAction({ text, callerName }) {
+  const digit = extractPressDigit(text);
+  if (!digit) return { digit: null, confidence: 0.0, reason: 'no-press-digit' };
+
+  const t = String(text || '');
+  const removal = hasRemovalIntent(t);
+  const strong = STRONG_REMOVAL_PATTERNS.some(rx => rx.test(t));
+
+  let confidence = 0.25;
+  let reason = 'press-digit-only';
+
+  if (strong) {
+    confidence = 0.97;
+    reason = 'strong-press-to-remove';
+  } else if (removal) {
+    confidence = 0.94;
+    reason = 'press+removal-intent';
+  } else if (isCnamSpam(callerName || '')) {
+    confidence = 0.90;
+    reason = 'press+cnam-spam';
+  } else {
+    // Example: "Press 1 to continue" (not removal)
+    confidence = 0.35;
+    reason = 'press-without-removal';
+  }
+
+  // Clamp
+  confidence = Math.max(0, Math.min(1, confidence));
+  return { digit, confidence, reason };
+}
+
+function canAutoPressNow({ from, digit }) {
+  const n10 = normalizeLast10(from || '');
+  const key = `${n10 || 'unknown'}:${String(digit)}`;
+  const now = Date.now();
+  const prev = pressRateLimit.get(key) || 0;
+  const windowMs = AUTO_PRESS_RATE_LIMIT_SECS * 1000;
+  if (now - prev < windowMs) return { ok: false, key, waitMs: windowMs - (now - prev) };
+  pressRateLimit.set(key, now);
+  return { ok: true, key, waitMs: 0 };
 }
 
 /* ================= Twilio REST helpers ================= */
@@ -618,7 +725,10 @@ function getState(callSid) {
       idleTimer: null,
       aiWS: undefined,
       twilioWS: undefined,
+
+      // ✅ Auto-press state
       dnc: { attempted: false, reason: '' },
+
       numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
       muteAssistant: false,
 
@@ -629,7 +739,7 @@ function getState(callSid) {
       aiSessionReady: false,
       selectedVoice: 'marin',
 
-      // ✅ NEW: sticky assistant identity for this call
+      // ✅ sticky assistant identity for this call
       assistantName: 'Trinity',
 
       // BARGE-IN: runtime flags (not prompt)
@@ -720,28 +830,85 @@ function exitNumberMode(callSid, reason) {
   console.log(`Number-mode: RELEASE (${reason}); collectedDigits=${s.numberMode.digits.length}`);
 }
 
-/* ================= Auto-DNC action ================= */
-async function sendDncDigitsAndMaybeHangup(callSid, reason='phrase') {
+/* ================= Auto-Press action (formerly Auto-DNC) ================= */
+function buildPressTwiml({ digitsToPlay, sayLine, hangup }) {
+  const safeDigits = String(digitsToPlay || '').replace(/[^0-9w]/g, '');
+  const say = String(sayLine || '').replace(/[<>&]/g, ''); // minimal safety
+  const hup = hangup ? '<Hangup/>' : '';
+  // ✅ Digits FIRST (better for IVR reliability), then optional line, then hangup
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+    (safeDigits ? `<Play digits="${safeDigits}"/>` : '') +
+    (say ? `<Pause length="1"/><Say>${say}</Say>` : '') +
+    hup +
+    `</Response>`
+  );
+}
+
+async function sendAutoPressAndMaybeHangup(callSid, { from, digit, reason }) {
   const s = getState(callSid);
   if (s.dnc.attempted) return;
+
+  // Rate limit per caller+digit
+  const rl = canAutoPressNow({ from, digit });
+  if (!rl.ok) {
+    console.log('AUTO-PRESS: rate-limited', { callSid, from: normalizeLast10(from), digit, reason, waitMs: rl.waitMs });
+    return;
+  }
+
+  s.dnc.attempted = true;
+  s.dnc.reason = reason || 'auto-press';
+
+  const digitsToPlay = String(digit); // single digit 0–9
+  const twiml = buildPressTwiml({
+    digitsToPlay,
+    sayLine: DNC_SAY_LINE,
+    hangup: DNC_HANGUP_AFTER
+  });
+
+  console.log('AUTO-PRESS: updating call TwiML', {
+    callSid,
+    from: normalizeLast10(from),
+    digit,
+    reason,
+    threshold: AUTO_PRESS_CONFIDENCE
+  });
+
+  try {
+    await twilioUpdateCallTwiml(callSid, twiml);
+  } catch (e) {
+    console.log('AUTO-PRESS failed:', e?.message);
+  }
+}
+
+// Back-compat: if no digit can be extracted (CNAM spam mode), press AUTO_DNC_DIGITS sequence
+async function sendDefaultDncDigitsAndMaybeHangup(callSid, reason='default') {
+  const s = getState(callSid);
+  if (s.dnc.attempted) return;
+
+  // Rate-limit using a pseudo-digit key "default"
+  const rl = canAutoPressNow({ from: s.meta.from || '', digit: 'default' });
+  if (!rl.ok) {
+    console.log('AUTO-PRESS(default): rate-limited', { callSid, waitMs: rl.waitMs });
+    return;
+  }
+
   s.dnc.attempted = true;
   s.dnc.reason = reason;
 
   try {
     const digits = buildDigitsString(AUTO_DNC_DIGITS, AUTO_DNC_GAP_MS);
-    const twiml =
-      `<?xml version="1.0" encoding="UTF-8"?>` +
-      `<Response>` +
-      `<Say>${DNC_SAY_LINE}</Say>` +
-      `<Pause length="1"/>` +
-      `<Play digits="${digits}"/>` +
-      `${DNC_HANGUP_AFTER ? '<Hangup/>' : ''}` +
-      `</Response>`;
+    const twiml = buildPressTwiml({
+      digitsToPlay: digits,
+      sayLine: DNC_SAY_LINE,
+      hangup: DNC_HANGUP_AFTER
+    });
 
-    console.log('AUTO-DNC: updating call TwiML', { callSid, reason, digits });
+    console.log('AUTO-PRESS(default): updating call TwiML', { callSid, reason, digits });
     await twilioUpdateCallTwiml(callSid, twiml);
   } catch (e) {
-    console.log('AUTO-DNC failed:', e?.message);
+    console.log('AUTO-PRESS(default) failed:', e?.message);
   }
 }
 
@@ -800,8 +967,31 @@ app.post('/transcripts', async (req, res) => {
 
       bumpActivity(callSid, 'speech');
 
-      if (AUTO_DNC_ENABLE && isRemovalPhrase(line)) {
-        await sendDncDigitsAndMaybeHangup(callSid, 'phrase');
+      // ✅ NEW: Auto-press digit 0–9 when confidence >= 0.90
+      // NOTE: We only use inbound_track lines (caller audio / robocall audio from Twilio transcription).
+      if (AUTO_DNC_ENABLE && track === 'inbound_track' && !buf.dnc.attempted) {
+        const { digit, confidence, reason } = inferAutoPressAction({
+          text: line,
+          callerName: buf.meta.callerName || ''
+        });
+
+        if (digit != null && confidence >= AUTO_PRESS_CONFIDENCE) {
+          console.log('AUTO-PRESS decision:', {
+            callSid,
+            from: normalizeLast10(buf.meta.from),
+            callerName: buf.meta.callerName || '',
+            digit,
+            confidence,
+            threshold: AUTO_PRESS_CONFIDENCE,
+            reason,
+            line: line.slice(0, 180)
+          });
+          await sendAutoPressAndMaybeHangup(callSid, {
+            from: buf.meta.from || '',
+            digit,
+            reason: `${reason};conf=${confidence.toFixed(2)}`
+          });
+        }
       }
 
       return res.status(200).send('ok');
@@ -1172,7 +1362,6 @@ wss.on('connection', (twilioWS, req) => {
           console.log('AI: session.updated => aiSessionReady=true');
           trySendGreetingNow('session.updated');
         }
-        // do not return; allow other logging below if needed
       }
 
       // BARGE-IN events
@@ -1275,10 +1464,11 @@ wss.on('connection', (twilioWS, req) => {
               assistantName = 'Trinity';
             }
 
+            // CNAM auto mode: if spam/scam name and not only-on-phrase, press default digits (back-compat)
             if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
               const s = getState(currentCallSid);
               if (isCnamSpam(s.meta.callerName)) {
-                await sendDncDigitsAndMaybeHangup(currentCallSid, 'cnam');
+                await sendDefaultDncDigitsAndMaybeHangup(currentCallSid, 'cnam');
               }
             }
           } catch (e) {
