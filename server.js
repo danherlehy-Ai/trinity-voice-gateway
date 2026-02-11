@@ -143,6 +143,12 @@ function normalizeLast10(p){
   return d.length <= 10 ? d : d.slice(-10);
 }
 
+function last4Of(phone='') {
+  const d = normalizeDigits(phone);
+  if (!d) return '';
+  return d.slice(-4);
+}
+
 // ✅ Add cedar to allowed voices
 const ALLOWED_VOICES = new Set([
   'marin','cedar','echo','alloy','ash','ballad','coral','fable','onyx','nova','sage','shimmer','verse'
@@ -225,7 +231,7 @@ function safeVipVibe(vip){
  * Build the base instruction block.
  * NOTE: identity stickiness is enforced by a separate IDENTITY_LOCK block appended later.
  */
-function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
+function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip, extraCallContext = '') {
   const vipMap = (Array.isArray(vips) ? vips : [])
     .filter(v => v && v.phone != null)
     .map(v => `${normalizeLast10(v.phone)}=${String(v.name || '').trim()}`)
@@ -260,6 +266,8 @@ function buildInstructions(system_prompt, vips, callerNumberRaw, callerVip) {
   if (callerVip) {
     lines.push(`[CALL CONTEXT] Recognized VIP: ${String(callerVip.name)} (${String(callerVip.relationship || 'VIP')}).`);
   }
+
+  if (extraCallContext) lines.push(extraCallContext);
 
   return lines.filter(Boolean).join('\n');
 }
@@ -711,6 +719,458 @@ async function hangupCall(callSid) {
   });
 }
 
+/* ============== Outbound-only Telegram bot (webhook) + Outbound Calls ============== */
+/**
+ * Separate bot token/chat from inbound bot.
+ * - Commands only accepted from TELEGRAM_OUTBOUND_ALLOWED_CHAT_ID (exact match).
+ * - Two-step approval required: /call -> server returns code -> user replies YES <code>
+ *
+ * ✅ Command format implemented:
+ *   /call <name> <last4> | <theme/summary>
+ * Example:
+ *   /call jeff 5680 | follow up about invoice and schedule pickup
+ */
+function normalizeChatId(x){ return String(x ?? '').trim(); }
+const OUT_TG_TOKEN = process.env.TELEGRAM_OUTBOUND_BOT_TOKEN || '';
+const OUT_TG_CHAT_ID = process.env.TELEGRAM_OUTBOUND_CHAT_ID || '';
+const OUT_TG_ALLOWED = process.env.TELEGRAM_OUTBOUND_ALLOWED_CHAT_ID || '';
+const OUT_TG_WEBHOOK_PATH = process.env.TELEGRAM_OUTBOUND_WEBHOOK_PATH || '/telegram-outbound-webhook';
+
+// Optional hardening: if you later set this env, Telegram will include header "X-Telegram-Bot-Api-Secret-Token".
+const OUT_TG_SECRET = process.env.TELEGRAM_OUTBOUND_WEBHOOK_SECRET || '';
+
+/**
+ * outboundPending:
+ * code -> { to, display, theme, createdAt, requestedByChatId }
+ */
+const outboundPending = new Map();
+const OUTBOUND_CODE_TTL_MS = Math.max(30_000, Number(process.env.OUTBOUND_CODE_TTL_MS || 2 * 60 * 1000)); // default 2 minutes
+
+function isAllowedOutboundChat(chatId){
+  const a = normalizeChatId(OUT_TG_ALLOWED);
+  if (!a) return false;
+  return normalizeChatId(chatId) === a;
+}
+
+async function sendOutboundTelegramMessage(text) {
+  if (!OUT_TG_TOKEN || !OUT_TG_CHAT_ID) {
+    console.log('Outbound Telegram env not set; skipping outbound send.');
+    return;
+  }
+  const endpoint = `https://api.telegram.org/bot${OUT_TG_TOKEN}/sendMessage`;
+  const MAX = 3800;
+  for (let i = 0; i < text.length; i += MAX) {
+    const part = text.slice(i, i + MAX);
+    try {
+      await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: OUT_TG_CHAT_ID, text: part })
+      });
+    } catch (e) {
+      console.log('Outbound Telegram send failed:', e?.message);
+    }
+  }
+}
+
+function makePublicHttpBase() {
+  // REQUIRED for outbound call creation & TwiML URL.
+  // Example: https://trinity-voice-gateway.onrender.com
+  const u = String(process.env.WEBHOOK_URL || '').trim().replace(/\/+$/,'');
+  return u;
+}
+
+function makePublicWsMediaUrl() {
+  const httpBase = makePublicHttpBase();
+  if (!httpBase) return '';
+  if (httpBase.startsWith('https://')) return httpBase.replace(/^https:\/\//i, 'wss://') + '/media';
+  if (httpBase.startsWith('http://'))  return httpBase.replace(/^http:\/\//i,  'ws://') + '/media';
+  return httpBase + '/media';
+}
+
+function xmlEscape(s=''){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
+
+function looksLikePhoneDigits(phone=''){
+  const d = normalizeDigits(phone);
+  return d.length >= 10; // 10+ digits
+}
+
+function normalizeToE164US(phone=''){
+  // if caller provides 10 digits, assume US +1
+  const raw = String(phone || '').trim();
+  const d = normalizeDigits(raw);
+  if (!d) return '';
+  if (raw.startsWith('+') && d.length >= 10) return '+' + d;
+  if (d.length === 10) return '+1' + d;
+  if (d.length === 11 && d.startsWith('1')) return '+'.concat(d);
+  // fallback: still return +digits
+  return '+' + d;
+}
+
+function purgeExpiredOutboundCodes() {
+  const now = Date.now();
+  for (const [code, rec] of outboundPending.entries()) {
+    if (!rec || now - rec.createdAt > OUTBOUND_CODE_TTL_MS) outboundPending.delete(code);
+  }
+}
+
+function makeShortCode() {
+  // 6-digit numeric
+  const n = Math.floor(Math.random() * 900000) + 100000;
+  return String(n);
+}
+
+function safeTheme(theme='') {
+  const t = String(theme || '').trim();
+  if (!t) return '';
+  // keep short-ish, remove newlines
+  return t.replace(/\s+/g,' ').slice(0, 280);
+}
+
+/**
+ * Parse "/call jeff 5680 | theme"
+ * Returns: { nameQuery, last4, theme } or null
+ */
+function parseCallCommand(text='') {
+  const raw = String(text || '').trim();
+
+  // Must start with "/call "
+  if (!raw.toLowerCase().startsWith('/call ')) return null;
+
+  const after = raw.slice(6).trim();
+  if (!after) return null;
+
+  // Split on pipe for theme
+  const parts = after.split('|');
+  const left = String(parts[0] || '').trim(); // "jeff 5680"
+  const theme = safeTheme(parts.slice(1).join('|')); // allow pipes in theme
+
+  // left can be: "<name> <last4>" OR a raw phone number
+  const tokens = left.split(/\s+/).filter(Boolean);
+
+  // if looks like phone digits directly
+  if (tokens.length === 1 && looksLikePhoneDigits(tokens[0])) {
+    return { directPhone: tokens[0], nameQuery: '', last4: '', theme };
+  }
+
+  // expect: name + last4
+  if (tokens.length < 2) return null;
+
+  const last = tokens[tokens.length - 1];
+  const l4 = normalizeDigits(last).slice(-4);
+  if (l4.length !== 4) return null;
+
+  const nameQuery = tokens.slice(0, -1).join(' ').trim();
+  if (!nameQuery) return null;
+
+  return { directPhone: '', nameQuery, last4: l4, theme };
+}
+
+function normalizeName(s='') {
+  return String(s || '').toLowerCase().trim().replace(/\s+/g,' ');
+}
+
+function vipMatchesNameAndLast4(vip, nameQuery, last4) {
+  const vipName = normalizeName(vip?.name || '');
+  const q = normalizeName(nameQuery || '');
+  if (!vipName || !q) return false;
+  if (!vipName.includes(q)) return false;
+  const vipL4 = last4Of(vip?.phone || '');
+  return vipL4 === String(last4 || '');
+}
+
+async function resolveOutboundRecipient({ nameQuery, last4, directPhone }) {
+  // Direct phone path
+  if (directPhone && looksLikePhoneDigits(directPhone)) {
+    const to = normalizeToE164US(directPhone);
+    return { ok: true, to, display: to, source: 'direct' };
+  }
+
+  // Lookup path using config.vips
+  const cfg = await getConfigCached({ forceFresh: true });
+  const vips = Array.isArray(cfg?.vips) ? cfg.vips : [];
+
+  const matches = vips.filter(v => vipMatchesNameAndLast4(v, nameQuery, last4));
+
+  if (matches.length === 0) {
+    return { ok: false, error: `No VIP match for "${nameQuery} ${last4}". (Check VIP list name/phone.)` };
+  }
+
+  // If multiple, pick the first but warn in Telegram (still safe)
+  const picked = matches[0];
+  const to = normalizeToE164US(picked.phone || '');
+  const display = `${picked.name || nameQuery} (${to})`;
+
+  return {
+    ok: true,
+    to,
+    display,
+    source: matches.length > 1 ? `vip-multi(${matches.length})` : 'vip'
+  };
+}
+
+async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '' }) {
+  const auth = twilioAuthHeader();
+  if (!auth) throw new Error('Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN env vars');
+
+  const from = String(process.env.TWILIO_OUTBOUND_FROM || '').trim();
+  if (!from) throw new Error('Missing TWILIO_OUTBOUND_FROM env var');
+
+  const httpBase = makePublicHttpBase();
+  if (!httpBase) throw new Error('Missing WEBHOOK_URL env var (must be your public https base)');
+
+  const url =
+    `${httpBase}/outbound-twiml` +
+    `?to=${encodeURIComponent(to)}` +
+    `&reason=${encodeURIComponent(reason)}` +
+    `&theme=${encodeURIComponent(safeTheme(theme))}` +
+    `&t=${Date.now()}`;
+
+  const form = new URLSearchParams();
+  form.set('To', to);
+  form.set('From', from);
+  form.set('Url', url);
+
+  // Useful callbacks/logging (optional, safe)
+  form.set('StatusCallback', `${httpBase}/outbound-status`);
+  form.set('StatusCallbackEvent', 'initiated ringing answered completed');
+  form.set('StatusCallbackMethod', 'POST');
+
+  const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${auth.accountSid}/Calls.json`, {
+    method: 'POST',
+    headers: {
+      'Authorization': auth.basic,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: form.toString()
+  });
+
+  const txt = await resp.text();
+  if (!resp.ok) throw new Error(`Twilio create call failed HTTP ${resp.status}: ${txt.slice(0, 500)}`);
+
+  let json = {};
+  try { json = JSON.parse(txt); } catch {}
+  return json;
+}
+
+/**
+ * TwiML endpoint for outbound calls.
+ * Twilio requests this URL when the outbound call is answered; we then connect the Media Stream.
+ */
+app.all('/outbound-twiml', (req, res) => {
+  try {
+    const q = req.query || {};
+    const to = String(q.to || '').trim();
+    const reason = String(q.reason || 'telegram').trim();
+    const theme = safeTheme(q.theme || '');
+
+    const wsUrl = makePublicWsMediaUrl();
+    if (!wsUrl) {
+      res.type('text/xml').status(500).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Server misconfigured.</Say><Hangup/></Response>`);
+      return;
+    }
+
+    // IMPORTANT: pass customParameters so /media sees from/to/callerName/callSid
+    const twiml =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<Response>` +
+        `<Connect>` +
+          `<Stream url="${xmlEscape(wsUrl)}">` +
+            `<Parameter name="from" value="${xmlEscape(to)}"/>` +
+            `<Parameter name="to" value="${xmlEscape(String(process.env.TWILIO_OUTBOUND_FROM || ''))}"/>` +
+            `<Parameter name="callerName" value="${xmlEscape('OUTBOUND')}"/>` +
+            `<Parameter name="callSid" value="${xmlEscape(String(req.body?.CallSid || req.query?.CallSid || ''))}"/>` +
+            `<Parameter name="reason" value="${xmlEscape(reason)}"/>` +
+            `<Parameter name="theme" value="${xmlEscape(theme)}"/>` +
+          `</Stream>` +
+        `</Connect>` +
+      `</Response>`;
+
+    res.type('text/xml').status(200).send(twiml);
+  } catch (e) {
+    console.log('outbound-twiml error:', e?.message);
+    res.type('text/xml').status(500).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
+  }
+});
+
+app.post('/outbound-status', (req, res) => {
+  try {
+    const b = req.body || {};
+    console.log('OUTBOUND STATUS:', {
+      CallSid: b.CallSid || b.callsid,
+      CallStatus: b.CallStatus || b.callstatus,
+      To: b.To || b.to,
+      From: b.From || b.from,
+      Timestamp: b.Timestamp || b.timestamp
+    });
+  } catch (e) {
+    console.log('outbound-status parse error:', e?.message);
+  }
+  res.status(204).end();
+});
+
+/**
+ * Outbound Telegram bot webhook endpoint.
+ * You will set Telegram webhook to: {WEBHOOK_URL}{OUT_TG_WEBHOOK_PATH}
+ */
+app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
+  res.status(200).send('ok');
+
+  try {
+    // Optional secret token check (only if you set env OUT_TG_SECRET)
+    if (OUT_TG_SECRET) {
+      const hdr = String(req.headers['x-telegram-bot-api-secret-token'] || '').trim();
+      if (hdr !== OUT_TG_SECRET) {
+        console.log('Outbound Telegram webhook: secret token mismatch; ignoring.');
+        return;
+      }
+    }
+
+    purgeExpiredOutboundCodes();
+
+    const update = req.body || {};
+    const msg = update.message || update.edited_message || null;
+    const text = String(msg?.text || '').trim();
+    const chatId = msg?.chat?.id != null ? String(msg.chat.id) : '';
+    const fromUser = msg?.from?.username ? `@${msg.from.username}` : (msg?.from?.first_name || 'unknown');
+
+    if (!text) return;
+
+    if (!isAllowedOutboundChat(chatId)) {
+      console.log('Outbound Telegram: blocked message from chatId', chatId, 'user', fromUser);
+      // No reply (silent drop) to avoid leaking bot behavior
+      return;
+    }
+
+    const lower = text.toLowerCase();
+
+    // Help
+    if (lower === '/help' || lower === 'help' || lower === '/start') {
+      await sendOutboundTelegramMessage(
+        `📤 Outbound Call Bot\n\n` +
+        `Command:\n` +
+        `• /call <name> <last4> | <theme/summary>\n\n` +
+        `Examples:\n` +
+        `• /call jeff 5680 | follow up about invoice and schedule pickup\n\n` +
+        `Confirm:\n` +
+        `• YES <code>\n` +
+        `Cancel:\n` +
+        `• /cancel <code>\n\n` +
+        `Notes:\n` +
+        `• Name + last4 must match a VIP in your config.\n` +
+        `• Two-step confirmation is required.\n`
+      );
+      return;
+    }
+
+    // /call request (step 1) — now supports: "/call name last4 | theme"
+    if (lower.startsWith('/call ')) {
+      const parsed = parseCallCommand(text);
+
+      if (!parsed) {
+        await sendOutboundTelegramMessage(
+          `❌ Format not recognized.\n\n` +
+          `Use:\n/call <name> <last4> | <theme/summary>\n` +
+          `Example:\n/call jeff 5680 | follow up about invoice`
+        );
+        return;
+      }
+
+      const theme = safeTheme(parsed.theme || '');
+      if (!theme) {
+        await sendOutboundTelegramMessage(
+          `❌ Missing theme/summary.\n\n` +
+          `Use:\n/call <name> <last4> | <theme/summary>\n` +
+          `Example:\n/call jeff 5680 | follow up about invoice`
+        );
+        return;
+      }
+
+      const resolved = await resolveOutboundRecipient({
+        nameQuery: parsed.nameQuery,
+        last4: parsed.last4,
+        directPhone: parsed.directPhone
+      });
+
+      if (!resolved.ok) {
+        await sendOutboundTelegramMessage(`❌ ${resolved.error || 'Could not resolve recipient.'}`);
+        return;
+      }
+
+      const code = makeShortCode();
+      outboundPending.set(code, {
+        to: resolved.to,
+        display: resolved.display,
+        theme,
+        createdAt: Date.now(),
+        requestedByChatId: chatId
+      });
+
+      const warning = resolved.source && String(resolved.source).startsWith('vip-multi')
+        ? `\n⚠️ Multiple VIP matches found; using the first match.\n`
+        : '';
+
+      await sendOutboundTelegramMessage(
+        `✅ Outbound call request received.\n\n` +
+        `To: ${resolved.display}\n` +
+        `Theme: ${theme}\n` +
+        warning +
+        `Confirmation code: ${code}\n\n` +
+        `Reply exactly:\nYES ${code}\n\n` +
+        `Or cancel:\n/cancel ${code}`
+      );
+      return;
+    }
+
+    // /cancel
+    if (lower.startsWith('/cancel ')) {
+      const code = text.slice(8).trim();
+      if (!outboundPending.has(code)) {
+        await sendOutboundTelegramMessage(`ℹ️ No pending request found for code ${code}.`);
+        return;
+      }
+      outboundPending.delete(code);
+      await sendOutboundTelegramMessage(`🛑 Cancelled pending outbound call (${code}).`);
+      return;
+    }
+
+    // YES <code> (step 2)
+    if (lower.startsWith('yes ')) {
+      const code = text.slice(4).trim();
+      const rec = outboundPending.get(code);
+      if (!rec) {
+        await sendOutboundTelegramMessage(`❌ That code is not valid (or expired). Send /call again.`);
+        return;
+      }
+      if (Date.now() - rec.createdAt > OUTBOUND_CODE_TTL_MS) {
+        outboundPending.delete(code);
+        await sendOutboundTelegramMessage(`⌛ That code expired. Send /call again.`);
+        return;
+      }
+
+      outboundPending.delete(code);
+
+      await sendOutboundTelegramMessage(`📞 Placing outbound call...\nTo: ${rec.display}\nTheme: ${rec.theme}`);
+
+      try {
+        const created = await twilioCreateOutboundCall({ to: rec.to, reason: 'telegram', theme: rec.theme });
+        const sid = created?.sid || created?.CallSid || '(unknown)';
+        await sendOutboundTelegramMessage(`✅ Call initiated.\nCallSid: ${sid}`);
+      } catch (e) {
+        await sendOutboundTelegramMessage(`❌ Failed to place call: ${String(e?.message || e).slice(0, 350)}`);
+      }
+      return;
+    }
+
+    // Default: ignore unknown commands but provide gentle nudge
+    await sendOutboundTelegramMessage(`ℹ️ Unknown command. Send /help`);
+  } catch (e) {
+    console.log('Outbound Telegram webhook handler error:', e?.message);
+  }
+});
+
 /* ============== Idle + number-mode helpers ============== */
 const NUMBER_SILENCE_GRACE_MS = Math.max(1000, Number(process.env.NUMBER_SILENCE_GRACE_MS || 2500));
 const NUMBER_MIN_DIGITS = Math.max(7, Number(process.env.NUMBER_MIN_DIGITS || 10));
@@ -720,7 +1180,19 @@ function getState(callSid) {
     transcripts.set(callSid, {
       events: [],
       greetingSkipped: false,
-      meta: { from: '', to: '', callerName: '', startedAt: null },
+      meta: {
+        from: '',
+        to: '',
+        callerName: '',
+        startedAt: null,
+
+        // ✅ outbound metadata (if this is an outbound call)
+        outbound: {
+          isOutbound: false,
+          reason: '',
+          theme: ''
+        }
+      },
       lastActivityAt: Date.now(),
       idleTimer: null,
       aiWS: undefined,
@@ -967,8 +1439,7 @@ app.post('/transcripts', async (req, res) => {
 
       bumpActivity(callSid, 'speech');
 
-      // ✅ NEW: Auto-press digit 0–9 when confidence >= 0.90
-      // NOTE: We only use inbound_track lines (caller audio / robocall audio from Twilio transcription).
+      // ✅ Auto-press digit 0–9 when confidence >= 0.90
       if (AUTO_DNC_ENABLE && track === 'inbound_track' && !buf.dnc.attempted) {
         const { digit, confidence, reason } = inferAutoPressAction({
           text: line,
@@ -1094,13 +1565,17 @@ wss.on('connection', (twilioWS, req) => {
   let callerVip = null;
   let callerName = null;
   let currentCallSid = null;
+
+  // ✅ outbound extras
+  let callReason = '';
+  let callTheme = '';
+
   const counters = { frames: 0, sentChunks: 0 };
 
   // Greeting context (per-connection)
   let selectedVoice = 'marin';
 
-  // ✅ NEW: sticky assistant name for this websocket connection/call
-  // (we also mirror it into getState(callSid).assistantName)
+  // ✅ sticky assistant name for this websocket connection/call
   let assistantName = 'Trinity';
 
   // Twilio clear helper (barge-in)
@@ -1165,7 +1640,22 @@ wss.on('connection', (twilioWS, req) => {
       s.assistantName = assistantName;
     }
 
-    const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip);
+    // ✅ outbound extra call context
+    let extraCallContext = '';
+    if (currentCallSid) {
+      const s = getState(currentCallSid);
+      if (s?.meta?.outbound?.isOutbound) {
+        extraCallContext =
+          `[OUTBOUND CALL CONTEXT]\n` +
+          `This is an OUTBOUND call placed by Dan's system.\n` +
+          (s.meta.outbound.reason ? `Reason tag: ${s.meta.outbound.reason}\n` : '') +
+          (s.meta.outbound.theme ? `Theme/summary: ${s.meta.outbound.theme}\n` : '') +
+          `Goal: be polite, confirm it’s a good time, and address the theme.\n` +
+          `Do NOT say “Dan hasn’t picked up yet” on outbound calls.\n`;
+      }
+    }
+
+    const base = buildInstructions(latestConfig.system_prompt, latestConfig.vips, callerFrom, callerVip, extraCallContext);
     const opening = pickOpening();
 
     const vipFirst = safeVipName(callerVip);
@@ -1259,19 +1749,29 @@ wss.on('connection', (twilioWS, req) => {
     // Use the locked assistantName from state if present, else connection-level fallback
     const aName = String(s.assistantName || assistantName || 'Trinity');
 
+    const isOutbound = Boolean(s?.meta?.outbound?.isOutbound);
+    const theme = safeTheme(s?.meta?.outbound?.theme || '');
+
     let greetLine;
-    if (callerVip) {
-      // VIP: personalize and use the locked assistantName
+
+    if (isOutbound) {
+      // ✅ OUTBOUND greeting
+      const about = theme ? ` I'm calling about: ${theme}.` : '';
+      greetLine = `Hi — this is ${aName} calling on behalf of Dan Herlehy.${about} Is now a good time?`;
+    } else if (callerVip) {
+      // VIP inbound greeting
       greetLine = vipFirst
         ? `Hi ${vipFirst} — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
         : `Hi — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`;
     } else {
-      // Non-VIP: simple greeting using locked name (normally Trinity)
+      // Non-VIP inbound
       greetLine = `Hi — it's ${aName}. How can I help?`;
     }
 
     console.log('GREETING: sending (post-session-ready):', {
       reason,
+      outbound: isOutbound,
+      theme,
       vip: callerVip ? callerVip.name : null,
       selectedVoice: s.selectedVoice || selectedVoice,
       assistantName: aName,
@@ -1417,7 +1917,8 @@ wss.on('connection', (twilioWS, req) => {
 
         case 'start': {
           streamSid = data.start?.streamSid;
-          console.log('WS: stream started', { streamSid, callSid: data.start?.callSid });
+          const startCallSid = data.start?.callSid || '';
+          console.log('WS: stream started', { streamSid, callSid: startCallSid });
           counters.frames = 0; counters.sentChunks = 0;
 
           try {
@@ -1432,14 +1933,20 @@ wss.on('connection', (twilioWS, req) => {
             const from  = getP('from');
             const to    = getP('to');
             const callerNameParam = getP('callerName');
-            const callSid = getP('callSid');
+            const callSidParam = getP('callSid');
+            const reasonParam = getP('reason');
+            const themeParam = getP('theme');
 
             console.log('Start.customParameters raw =', params);
-            console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid });
+            console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid: callSidParam, reason: reasonParam, theme: themeParam });
 
-            currentCallSid = callSid || currentCallSid;
+            // ✅ Better: if callSid wasn't provided, trust data.start.callSid
+            currentCallSid = callSidParam || startCallSid || currentCallSid;
             callerFrom = from || callerFrom;
             callerName = callerNameParam || callerName;
+
+            callReason = String(reasonParam || '').trim();
+            callTheme = safeTheme(themeParam || '');
 
             if (currentCallSid) {
               const s = getState(currentCallSid);
@@ -1450,6 +1957,12 @@ wss.on('connection', (twilioWS, req) => {
               if (callerNameParam && !s.meta.callerName) s.meta.callerName = callerNameParam;
               if (!s.meta.startedAt) s.meta.startedAt = new Date();
               resetIdleTimer(currentCallSid);
+
+              // outbound flags
+              const isOutbound = String(callerNameParam || '').toUpperCase() === 'OUTBOUND';
+              s.meta.outbound.isOutbound = isOutbound;
+              s.meta.outbound.reason = callReason || '';
+              s.meta.outbound.theme = callTheme || '';
 
               // reset greeting readiness for this call
               s.aiSessionReady = false;
