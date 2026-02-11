@@ -1594,6 +1594,7 @@ wss.on('connection', (twilioWS, req) => {
   }
 
   function computeAssistantNameForCall(vip, chosenVoice) {
+    // ✅ REQUIRED DEFAULT: if no VIP match / no usable VIP override → "Trinity"
     if (vip && hasVipVoiceOverride(vip)) return displayVoiceName(chosenVoice);
     return 'Trinity';
   }
@@ -1623,13 +1624,28 @@ wss.on('connection', (twilioWS, req) => {
     if (currentCallSid) {
       const s = getState(currentCallSid);
       if (s?.meta?.outbound?.isOutbound) {
+        const aName = String(s.assistantName || assistantName || 'Trinity');
+        const recName = String(s.meta.outbound.recipientName || '').trim();
+        const theme = safeTheme(s.meta.outbound.theme || '');
+
+        // ✅ HARD OUTBOUND OPENING (verbatim)
+        // This is the thing you asked for: name first, then identity, then reason/theme.
+        const who = recName ? `Hi ${recName},` : 'Hi,';
+        const script =
+          theme
+            ? `${who} this is ${aName}, Dan's VIP assistant. Dan asked me to call to ask: ${theme} Is now a good time?`
+            : `${who} this is ${aName}, Dan's VIP assistant. Dan asked me to call. Is now a good time?`;
+
         extraCallContext =
           `[OUTBOUND CALL CONTEXT]\n` +
           `This is an OUTBOUND call placed by Dan's system.\n` +
           (s.meta.outbound.reason ? `Reason tag: ${s.meta.outbound.reason}\n` : '') +
-          (s.meta.outbound.theme ? `Theme/summary: ${s.meta.outbound.theme}\n` : '') +
+          (theme ? `Theme/summary: ${theme}\n` : '') +
           `Goal: be polite, confirm it’s a good time, and address the theme.\n` +
-          `Do NOT say “Dan hasn’t picked up yet” on outbound calls.\n`;
+          `Do NOT say “Dan hasn’t picked up yet” on outbound calls.\n` +
+          `CRITICAL: Your FIRST spoken sentence on outbound calls MUST be VERBATIM (no paraphrase, no slang, no rewording):\n` +
+          `"${script}"\n` +
+          `Forbidden openers on outbound: "hey", "what's up", "what's the deal", or jumping straight into the theme without saying who you are.\n`;
       }
     }
 
@@ -1733,11 +1749,14 @@ wss.on('connection', (twilioWS, req) => {
     let greetLine;
 
     if (isOutbound) {
-      // ✅ OUTBOUND greeting: short hello, immediately state theme/reason
-      // If we have a name, use it.
-      const who = recName ? `Hi ${recName}` : `Hi`;
-      const about = theme ? ` Dan asked me to call about: ${theme}.` : ` Dan asked me to call.`;
-      greetLine = `${who} — this is ${aName}, Dan’s VIP AI assistant.${about} Is now a good time?`;
+      // ✅ OUTBOUND greeting: RECIPIENT NAME FIRST, then identity, then the theme
+      // This is the exact format you requested (no "what's up", no slang).
+      const who = recName ? `Hi ${recName},` : 'Hi,';
+      if (theme) {
+        greetLine = `${who} this is ${aName}, Dan's VIP assistant. Dan asked me to call to ask: ${theme} Is now a good time?`;
+      } else {
+        greetLine = `${who} this is ${aName}, Dan's VIP assistant. Dan asked me to call. Is now a good time?`;
+      }
     } else if (callerVip) {
       greetLine = vipFirst
         ? `Hi ${vipFirst} — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
@@ -1758,9 +1777,14 @@ wss.on('connection', (twilioWS, req) => {
     });
 
     try {
+      // ✅ EXTRA HARDENING: explicitly forbid paraphrase for this single utterance.
       aiWS.send(JSON.stringify({
         type: 'response.create',
-        response: { instructions: `Say exactly: "${greetLine}"` }
+        response: {
+          instructions:
+            `You must speak the following sentence VERBATIM. Do not paraphrase, do not add slang, do not change wording. ` +
+            `Say exactly: "${greetLine}"`
+        }
       }));
     } catch (e) {
       console.log('GREETING: send failed:', e?.message);
