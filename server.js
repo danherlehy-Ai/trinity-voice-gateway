@@ -426,12 +426,6 @@ const IDLE_SEND_GOODBYE = String(process.env.IDLE_SEND_GOODBYE || 'true').toLowe
 const GOODBYE_LINE = process.env.IDLE_GOODBYE_LINE || "Thanks for calling — happy to help next time. Goodbye!";
 
 /* ================= Auto-Press (DNC/opt-out) env & helpers ================= */
-/**
- * Goal:
- * - Detect robocalls that say "Press X to be removed / opt out / unsubscribe / do-not-call"
- * - Automatically press the detected digit (0-9) only if confidence >= threshold (default 0.90)
- * - Rate-limit per caller+digit to avoid repeated actions
- */
 const AUTO_DNC_ENABLE       = String(process.env.AUTO_DNC_ENABLE || 'true').toLowerCase() === 'true';
 const AUTO_DNC_ON_CNAM      = String(process.env.AUTO_DNC_ON_CNAM || 'true').toLowerCase() === 'true';
 const AUTO_DNC_ONLY_PHRASE  = String(process.env.AUTO_DNC_ONLY_ON_PHRASE || 'false').toLowerCase() === 'true';
@@ -514,13 +508,6 @@ function hasRemovalIntent(text='') {
   return false;
 }
 
-/**
- * AI-like confidence scoring (deterministic, no extra API calls):
- * - Strong "press X to be removed/opt out/unsubscribe" => 0.97
- * - "press X" + any removal intent => 0.92–0.95
- * - CNAM says spam/scam + press X => 0.90
- * - Otherwise low confidence
- */
 function inferAutoPressAction({ text, callerName }) {
   const digit = extractPressDigit(text);
   if (!digit) return { digit: null, confidence: 0.0, reason: 'no-press-digit' };
@@ -542,12 +529,10 @@ function inferAutoPressAction({ text, callerName }) {
     confidence = 0.90;
     reason = 'press+cnam-spam';
   } else {
-    // Example: "Press 1 to continue" (not removal)
     confidence = 0.35;
     reason = 'press-without-removal';
   }
 
-  // Clamp
   confidence = Math.max(0, Math.min(1, confidence));
   return { digit, confidence, reason };
 }
@@ -720,28 +705,16 @@ async function hangupCall(callSid) {
 }
 
 /* ============== Outbound-only Telegram bot (webhook) + Outbound Calls ============== */
-/**
- * Separate bot token/chat from inbound bot.
- * - Commands only accepted from TELEGRAM_OUTBOUND_ALLOWED_CHAT_ID (exact match).
- * - Two-step approval required: /call -> server returns code -> user replies YES <code>
- *
- * ✅ Command format implemented:
- *   /call <name> <last4> | <theme/summary>
- * Example:
- *   /call jeff 5680 | follow up about invoice and schedule pickup
- */
 function normalizeChatId(x){ return String(x ?? '').trim(); }
 const OUT_TG_TOKEN = process.env.TELEGRAM_OUTBOUND_BOT_TOKEN || '';
 const OUT_TG_CHAT_ID = process.env.TELEGRAM_OUTBOUND_CHAT_ID || '';
 const OUT_TG_ALLOWED = process.env.TELEGRAM_OUTBOUND_ALLOWED_CHAT_ID || '';
 const OUT_TG_WEBHOOK_PATH = process.env.TELEGRAM_OUTBOUND_WEBHOOK_PATH || '/telegram-outbound-webhook';
-
-// Optional hardening: if you later set this env, Telegram will include header "X-Telegram-Bot-Api-Secret-Token".
 const OUT_TG_SECRET = process.env.TELEGRAM_OUTBOUND_WEBHOOK_SECRET || '';
 
 /**
  * outboundPending:
- * code -> { to, display, theme, createdAt, requestedByChatId }
+ * code -> { to, display, theme, recipientName, createdAt, requestedByChatId }
  */
 const outboundPending = new Map();
 const OUTBOUND_CODE_TTL_MS = Math.max(30_000, Number(process.env.OUTBOUND_CODE_TTL_MS || 2 * 60 * 1000)); // default 2 minutes
@@ -798,14 +771,12 @@ function looksLikePhoneDigits(phone=''){
 }
 
 function normalizeToE164US(phone=''){
-  // if caller provides 10 digits, assume US +1
   const raw = String(phone || '').trim();
   const d = normalizeDigits(raw);
   if (!d) return '';
   if (raw.startsWith('+') && d.length >= 10) return '+' + d;
   if (d.length === 10) return '+1' + d;
   if (d.length === 11 && d.startsWith('1')) return '+'.concat(d);
-  // fallback: still return +digits
   return '+' + d;
 }
 
@@ -817,7 +788,6 @@ function purgeExpiredOutboundCodes() {
 }
 
 function makeShortCode() {
-  // 6-digit numeric
   const n = Math.floor(Math.random() * 900000) + 100000;
   return String(n);
 }
@@ -825,37 +795,26 @@ function makeShortCode() {
 function safeTheme(theme='') {
   const t = String(theme || '').trim();
   if (!t) return '';
-  // keep short-ish, remove newlines
   return t.replace(/\s+/g,' ').slice(0, 280);
 }
 
-/**
- * Parse "/call jeff 5680 | theme"
- * Returns: { nameQuery, last4, theme } or null
- */
 function parseCallCommand(text='') {
   const raw = String(text || '').trim();
-
-  // Must start with "/call "
   if (!raw.toLowerCase().startsWith('/call ')) return null;
 
   const after = raw.slice(6).trim();
   if (!after) return null;
 
-  // Split on pipe for theme
   const parts = after.split('|');
-  const left = String(parts[0] || '').trim(); // "jeff 5680"
-  const theme = safeTheme(parts.slice(1).join('|')); // allow pipes in theme
+  const left = String(parts[0] || '').trim();
+  const theme = safeTheme(parts.slice(1).join('|'));
 
-  // left can be: "<name> <last4>" OR a raw phone number
   const tokens = left.split(/\s+/).filter(Boolean);
 
-  // if looks like phone digits directly
   if (tokens.length === 1 && looksLikePhoneDigits(tokens[0])) {
     return { directPhone: tokens[0], nameQuery: '', last4: '', theme };
   }
 
-  // expect: name + last4
   if (tokens.length < 2) return null;
 
   const last = tokens[tokens.length - 1];
@@ -882,13 +841,11 @@ function vipMatchesNameAndLast4(vip, nameQuery, last4) {
 }
 
 async function resolveOutboundRecipient({ nameQuery, last4, directPhone }) {
-  // Direct phone path
   if (directPhone && looksLikePhoneDigits(directPhone)) {
     const to = normalizeToE164US(directPhone);
-    return { ok: true, to, display: to, source: 'direct' };
+    return { ok: true, to, display: to, recipientName: '', source: 'direct' };
   }
 
-  // Lookup path using config.vips
   const cfg = await getConfigCached({ forceFresh: true });
   const vips = Array.isArray(cfg?.vips) ? cfg.vips : [];
 
@@ -898,7 +855,6 @@ async function resolveOutboundRecipient({ nameQuery, last4, directPhone }) {
     return { ok: false, error: `No VIP match for "${nameQuery} ${last4}". (Check VIP list name/phone.)` };
   }
 
-  // If multiple, pick the first but warn in Telegram (still safe)
   const picked = matches[0];
   const to = normalizeToE164US(picked.phone || '');
   const display = `${picked.name || nameQuery} (${to})`;
@@ -907,11 +863,12 @@ async function resolveOutboundRecipient({ nameQuery, last4, directPhone }) {
     ok: true,
     to,
     display,
+    recipientName: safeVipName(picked) || (picked.name || ''),
     source: matches.length > 1 ? `vip-multi(${matches.length})` : 'vip'
   };
 }
 
-async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '' }) {
+async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '', recipientName = '' }) {
   const auth = twilioAuthHeader();
   if (!auth) throw new Error('Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN env vars');
 
@@ -926,6 +883,7 @@ async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '' })
     `?to=${encodeURIComponent(to)}` +
     `&reason=${encodeURIComponent(reason)}` +
     `&theme=${encodeURIComponent(safeTheme(theme))}` +
+    `&recipientName=${encodeURIComponent(String(recipientName || '').trim())}` +
     `&t=${Date.now()}`;
 
   const form = new URLSearchParams();
@@ -933,7 +891,6 @@ async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '' })
   form.set('From', from);
   form.set('Url', url);
 
-  // Useful callbacks/logging (optional, safe)
   form.set('StatusCallback', `${httpBase}/outbound-status`);
   form.set('StatusCallbackEvent', 'initiated ringing answered completed');
   form.set('StatusCallbackMethod', 'POST');
@@ -957,7 +914,8 @@ async function twilioCreateOutboundCall({ to, reason = 'telegram', theme = '' })
 
 /**
  * TwiML endpoint for outbound calls.
- * Twilio requests this URL when the outbound call is answered; we then connect the Media Stream.
+ * ✅ NOW includes: <Start><Recording> + <Start><Transcription>
+ * ✅ Callbacks go to: /recordings and /transcripts (same as inbound pipeline)
  */
 app.all('/outbound-twiml', (req, res) => {
   try {
@@ -965,25 +923,69 @@ app.all('/outbound-twiml', (req, res) => {
     const to = String(q.to || '').trim();
     const reason = String(q.reason || 'telegram').trim();
     const theme = safeTheme(q.theme || '');
+    const recipientName = String(q.recipientName || '').trim();
 
+    const httpBase = makePublicHttpBase();
     const wsUrl = makePublicWsMediaUrl();
-    if (!wsUrl) {
+
+    if (!httpBase || !wsUrl) {
       res.type('text/xml').status(500).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Server misconfigured.</Say><Hangup/></Response>`);
       return;
     }
 
-    // IMPORTANT: pass customParameters so /media sees from/to/callerName/callSid
+    // Twilio posts CallSid in the request body (Urlencoded)
+    const callSidFromTwilio = String(req.body?.CallSid || req.query?.CallSid || '').trim();
+    const fromNumber = String(process.env.TWILIO_OUTBOUND_FROM || '').trim();
+
+    // ✅ IMPORTANT: these callbacks are what make outbound behave like inbound
+    // (recording download + Telegram audio, transcription + Telegram text)
+    const recordingCb =
+      `${httpBase}/recordings` +
+      `?from=${encodeURIComponent(to)}` +
+      `&to=${encodeURIComponent(fromNumber)}` +
+      `&callerName=${encodeURIComponent('OUTBOUND')}` +
+      `&reason=${encodeURIComponent(reason)}` +
+      `&theme=${encodeURIComponent(theme)}`;
+
+    const transcriptCb =
+      `${httpBase}/transcripts` +
+      `?from=${encodeURIComponent(to)}` +
+      `&to=${encodeURIComponent(fromNumber)}` +
+      `&callerName=${encodeURIComponent('OUTBOUND')}` +
+      `&reason=${encodeURIComponent(reason)}` +
+      `&theme=${encodeURIComponent(theme)}`;
+
     const twiml =
       `<?xml version="1.0" encoding="UTF-8"?>` +
       `<Response>` +
+
+        // ✅ Start dual-channel recording (same concept as inbound function)
+        `<Start>` +
+          `<Recording ` +
+            `recordingStatusCallback="${xmlEscape(recordingCb)}" ` +
+            `recordingStatusCallbackMethod="POST" ` +
+            `recordingChannels="dual" ` +
+          `/>` +
+        `</Start>` +
+
+        // ✅ Start transcription for both tracks
+        `<Start>` +
+          `<Transcription ` +
+            `track="both_tracks" ` +
+            `statusCallbackUrl="${xmlEscape(transcriptCb)}" ` +
+            `statusCallbackMethod="POST" ` +
+          `/>` +
+        `</Start>` +
+
         `<Connect>` +
           `<Stream url="${xmlEscape(wsUrl)}">` +
             `<Parameter name="from" value="${xmlEscape(to)}"/>` +
-            `<Parameter name="to" value="${xmlEscape(String(process.env.TWILIO_OUTBOUND_FROM || ''))}"/>` +
+            `<Parameter name="to" value="${xmlEscape(fromNumber)}"/>` +
             `<Parameter name="callerName" value="${xmlEscape('OUTBOUND')}"/>` +
-            `<Parameter name="callSid" value="${xmlEscape(String(req.body?.CallSid || req.query?.CallSid || ''))}"/>` +
+            `<Parameter name="callSid" value="${xmlEscape(callSidFromTwilio)}"/>` +
             `<Parameter name="reason" value="${xmlEscape(reason)}"/>` +
             `<Parameter name="theme" value="${xmlEscape(theme)}"/>` +
+            `<Parameter name="recipientName" value="${xmlEscape(recipientName)}"/>` +
           `</Stream>` +
         `</Connect>` +
       `</Response>`;
@@ -1019,7 +1021,6 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
   res.status(200).send('ok');
 
   try {
-    // Optional secret token check (only if you set env OUT_TG_SECRET)
     if (OUT_TG_SECRET) {
       const hdr = String(req.headers['x-telegram-bot-api-secret-token'] || '').trim();
       if (hdr !== OUT_TG_SECRET) {
@@ -1040,13 +1041,11 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
 
     if (!isAllowedOutboundChat(chatId)) {
       console.log('Outbound Telegram: blocked message from chatId', chatId, 'user', fromUser);
-      // No reply (silent drop) to avoid leaking bot behavior
       return;
     }
 
     const lower = text.toLowerCase();
 
-    // Help
     if (lower === '/help' || lower === 'help' || lower === '/start') {
       await sendOutboundTelegramMessage(
         `📤 Outbound Call Bot\n\n` +
@@ -1065,7 +1064,6 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
       return;
     }
 
-    // /call request (step 1) — now supports: "/call name last4 | theme"
     if (lower.startsWith('/call ')) {
       const parsed = parseCallCommand(text);
 
@@ -1104,6 +1102,7 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
         to: resolved.to,
         display: resolved.display,
         theme,
+        recipientName: String(resolved.recipientName || '').trim(),
         createdAt: Date.now(),
         requestedByChatId: chatId
       });
@@ -1124,7 +1123,6 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
       return;
     }
 
-    // /cancel
     if (lower.startsWith('/cancel ')) {
       const code = text.slice(8).trim();
       if (!outboundPending.has(code)) {
@@ -1136,7 +1134,6 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
       return;
     }
 
-    // YES <code> (step 2)
     if (lower.startsWith('yes ')) {
       const code = text.slice(4).trim();
       const rec = outboundPending.get(code);
@@ -1155,7 +1152,12 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
       await sendOutboundTelegramMessage(`📞 Placing outbound call...\nTo: ${rec.display}\nTheme: ${rec.theme}`);
 
       try {
-        const created = await twilioCreateOutboundCall({ to: rec.to, reason: 'telegram', theme: rec.theme });
+        const created = await twilioCreateOutboundCall({
+          to: rec.to,
+          reason: 'telegram',
+          theme: rec.theme,
+          recipientName: rec.recipientName
+        });
         const sid = created?.sid || created?.CallSid || '(unknown)';
         await sendOutboundTelegramMessage(`✅ Call initiated.\nCallSid: ${sid}`);
       } catch (e) {
@@ -1164,7 +1166,6 @@ app.post(OUT_TG_WEBHOOK_PATH, async (req, res) => {
       return;
     }
 
-    // Default: ignore unknown commands but provide gentle nudge
     await sendOutboundTelegramMessage(`ℹ️ Unknown command. Send /help`);
   } catch (e) {
     console.log('Outbound Telegram webhook handler error:', e?.message);
@@ -1186,11 +1187,11 @@ function getState(callSid) {
         callerName: '',
         startedAt: null,
 
-        // ✅ outbound metadata (if this is an outbound call)
         outbound: {
           isOutbound: false,
           reason: '',
-          theme: ''
+          theme: '',
+          recipientName: ''
         }
       },
       lastActivityAt: Date.now(),
@@ -1198,23 +1199,19 @@ function getState(callSid) {
       aiWS: undefined,
       twilioWS: undefined,
 
-      // ✅ Auto-press state
       dnc: { attempted: false, reason: '' },
 
       numberMode: { active: false, digits: '', timer: null, lastDigitAt: 0 },
       muteAssistant: false,
 
-      // Greeting gating
       greetedOnce: false,
       greetingPending: false,
       greetingTimer: null,
       aiSessionReady: false,
       selectedVoice: 'marin',
 
-      // ✅ sticky assistant identity for this call
       assistantName: 'Trinity',
 
-      // BARGE-IN: runtime flags (not prompt)
       bargeIn: { active: false, lastAt: 0 },
       aiSpeaking: false
     });
@@ -1295,7 +1292,6 @@ function exitNumberMode(callSid, reason) {
   if (!s.numberMode.active) return;
   s.numberMode.active = false;
 
-  // Only unmute if not actively barged-in
   if (!s.bargeIn.active) s.muteAssistant = false;
 
   if (s.numberMode.timer) { clearTimeout(s.numberMode.timer); s.numberMode.timer = null; }
@@ -1305,9 +1301,8 @@ function exitNumberMode(callSid, reason) {
 /* ================= Auto-Press action (formerly Auto-DNC) ================= */
 function buildPressTwiml({ digitsToPlay, sayLine, hangup }) {
   const safeDigits = String(digitsToPlay || '').replace(/[^0-9w]/g, '');
-  const say = String(sayLine || '').replace(/[<>&]/g, ''); // minimal safety
+  const say = String(sayLine || '').replace(/[<>&]/g, '');
   const hup = hangup ? '<Hangup/>' : '';
-  // ✅ Digits FIRST (better for IVR reliability), then optional line, then hangup
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
@@ -1322,7 +1317,6 @@ async function sendAutoPressAndMaybeHangup(callSid, { from, digit, reason }) {
   const s = getState(callSid);
   if (s.dnc.attempted) return;
 
-  // Rate limit per caller+digit
   const rl = canAutoPressNow({ from, digit });
   if (!rl.ok) {
     console.log('AUTO-PRESS: rate-limited', { callSid, from: normalizeLast10(from), digit, reason, waitMs: rl.waitMs });
@@ -1332,7 +1326,7 @@ async function sendAutoPressAndMaybeHangup(callSid, { from, digit, reason }) {
   s.dnc.attempted = true;
   s.dnc.reason = reason || 'auto-press';
 
-  const digitsToPlay = String(digit); // single digit 0–9
+  const digitsToPlay = String(digit);
   const twiml = buildPressTwiml({
     digitsToPlay,
     sayLine: DNC_SAY_LINE,
@@ -1354,12 +1348,10 @@ async function sendAutoPressAndMaybeHangup(callSid, { from, digit, reason }) {
   }
 }
 
-// Back-compat: if no digit can be extracted (CNAM spam mode), press AUTO_DNC_DIGITS sequence
 async function sendDefaultDncDigitsAndMaybeHangup(callSid, reason='default') {
   const s = getState(callSid);
   if (s.dnc.attempted) return;
 
-  // Rate-limit using a pseudo-digit key "default"
   const rl = canAutoPressNow({ from: s.meta.from || '', digit: 'default' });
   if (!rl.ok) {
     console.log('AUTO-PRESS(default): rate-limited', { callSid, waitMs: rl.waitMs });
@@ -1439,7 +1431,6 @@ app.post('/transcripts', async (req, res) => {
 
       bumpActivity(callSid, 'speech');
 
-      // ✅ Auto-press digit 0–9 when confidence >= 0.90
       if (AUTO_DNC_ENABLE && track === 'inbound_track' && !buf.dnc.attempted) {
         const { digit, confidence, reason } = inferAutoPressAction({
           text: line,
@@ -1543,7 +1534,7 @@ app.post('/recordings', async (req, res) => {
     const ok = await sendTelegramAudio(buffer, filename, caption);
     if (!ok) {
       await sendTelegramMessage(
-        caption + `\n\n(Upload to Telegram failed. Twilio Recording URL may require login/auth.)\n${recordingUrl}`
+        caption + `\n\n(Upload to Telegram failed.)\n${recordingUrl}`
       );
     } else {
       console.log('RECORDING: sent audio to Telegram:', filename);
@@ -1569,16 +1560,13 @@ wss.on('connection', (twilioWS, req) => {
   // ✅ outbound extras
   let callReason = '';
   let callTheme = '';
+  let callRecipientName = '';
 
   const counters = { frames: 0, sentChunks: 0 };
 
-  // Greeting context (per-connection)
   let selectedVoice = 'marin';
-
-  // ✅ sticky assistant name for this websocket connection/call
   let assistantName = 'Trinity';
 
-  // Twilio clear helper (barge-in)
   function twilioClearBufferedAudio() {
     try {
       if (!streamSid) return;
@@ -1605,12 +1593,6 @@ wss.on('connection', (twilioWS, req) => {
     return found || null;
   }
 
-  /**
-   * Decide the assistant "identity name" for this call.
-   * Rule:
-   * - If VIP + explicit voice override => name becomes the voice display name (e.g., "Sage", "Ballad") for the whole call.
-   * - Otherwise => "Trinity"
-   */
   function computeAssistantNameForCall(vip, chosenVoice) {
     if (vip && hasVipVoiceOverride(vip)) return displayVoiceName(chosenVoice);
     return 'Trinity';
@@ -1629,18 +1611,14 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     selectedVoice = chooseVoice(process.env.DEFAULT_VOICE || 'marin', callerVip);
-
-    // ✅ Sticky assistant identity is computed ONCE per (re)config and then enforced via instructions
     assistantName = computeAssistantNameForCall(callerVip, selectedVoice);
 
-    // Store on call state if available
     if (currentCallSid) {
       const s = getState(currentCallSid);
       s.selectedVoice = selectedVoice;
       s.assistantName = assistantName;
     }
 
-    // ✅ outbound extra call context
     let extraCallContext = '';
     if (currentCallSid) {
       const s = getState(currentCallSid);
@@ -1662,7 +1640,6 @@ wss.on('connection', (twilioWS, req) => {
     const persona = String(callerVip?.persona_notes || '').trim();
     const vibe = safeVipVibe(callerVip);
 
-    // ✅ IDENTITY LOCK: prevents later “Who am I speaking with?” from reverting to Trinity
     const IDENTITY_LOCK =
       `\n[ASSISTANT IDENTITY — LOCKED FOR THIS CALL]\n` +
       `Your assistant name for this entire call is: "${assistantName}".\n` +
@@ -1716,20 +1693,18 @@ wss.on('connection', (twilioWS, req) => {
     }));
   }
 
-  // Greeting scheduling: we want “no dead air” but also “no speak until session is truly ready”.
   function scheduleGreetingAttempt() {
     if (!currentCallSid) return;
     const s = getState(currentCallSid);
 
     s.greetingPending = true;
 
-    // safety: clear existing timer
     if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
 
-    // fallback attempt after 6s (still gated by aiSessionReady)
+    // fallback attempt after 6s
     s.greetingTimer = setTimeout(() => trySendGreetingNow('fallback-timeout'), 6000);
 
-    // immediate attempt (if already ready)
+    // immediate attempt
     trySendGreetingNow('schedule');
   }
 
@@ -1738,40 +1713,44 @@ wss.on('connection', (twilioWS, req) => {
     const s = getState(currentCallSid);
     if (s.greetedOnce) return;
     if (!s.greetingPending) return;
-    if (!s.aiSessionReady) return; // <- critical gating
+
+    const isOutbound = Boolean(s?.meta?.outbound?.isOutbound);
+
+    // ✅ CRITICAL FIX:
+    // Outbound should NOT wait for session.updated (callee often says “hello” first otherwise).
+    if (!s.aiSessionReady && !isOutbound) return;
 
     s.greetedOnce = true;
     s.greetingPending = false;
     if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
 
     const vipFirst = safeVipName(callerVip);
-
-    // Use the locked assistantName from state if present, else connection-level fallback
     const aName = String(s.assistantName || assistantName || 'Trinity');
 
-    const isOutbound = Boolean(s?.meta?.outbound?.isOutbound);
     const theme = safeTheme(s?.meta?.outbound?.theme || '');
+    const recName = String(s?.meta?.outbound?.recipientName || '').trim();
 
     let greetLine;
 
     if (isOutbound) {
-      // ✅ OUTBOUND greeting
-      const about = theme ? ` I'm calling about: ${theme}.` : '';
-      greetLine = `Hi — this is ${aName} calling on behalf of Dan Herlehy.${about} Is now a good time?`;
+      // ✅ OUTBOUND greeting: short hello, immediately state theme/reason
+      // If we have a name, use it.
+      const who = recName ? `Hi ${recName}` : `Hi`;
+      const about = theme ? ` Dan asked me to call about: ${theme}.` : ` Dan asked me to call.`;
+      greetLine = `${who} — this is ${aName}, Dan’s VIP AI assistant.${about} Is now a good time?`;
     } else if (callerVip) {
-      // VIP inbound greeting
       greetLine = vipFirst
         ? `Hi ${vipFirst} — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`
         : `Hi — This is ${aName}, Dan's VIP Assistant. Dan hasn't picked up yet. How can I help?`;
     } else {
-      // Non-VIP inbound
       greetLine = `Hi — it's ${aName}. How can I help?`;
     }
 
-    console.log('GREETING: sending (post-session-ready):', {
+    console.log('GREETING: sending:', {
       reason,
       outbound: isOutbound,
       theme,
+      recipientName: recName || null,
       vip: callerVip ? callerVip.name : null,
       selectedVoice: s.selectedVoice || selectedVoice,
       assistantName: aName,
@@ -1788,7 +1767,6 @@ wss.on('connection', (twilioWS, req) => {
     }
   }
 
-  // BARGE-IN: cancel/clear helper (OpenAI + Twilio + local mute)
   function handleBargeInStart(reason = 'speech_started') {
     if (!currentCallSid) return;
     const s = getState(currentCallSid);
@@ -1799,13 +1777,10 @@ wss.on('connection', (twilioWS, req) => {
     s.bargeIn.active = true;
     s.bargeIn.lastAt = now;
 
-    // Immediately mute sending assistant audio deltas
     s.muteAssistant = true;
 
-    // Flush any audio already buffered on Twilio’s side
     twilioClearBufferedAudio();
 
-    // Cancel active response & clear output audio buffer
     try {
       if (aiWS.readyState === 1) {
         aiWS.send(JSON.stringify({ type: 'response.cancel' }));
@@ -1854,7 +1829,6 @@ wss.on('connection', (twilioWS, req) => {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Greeting readiness: wait for session.updated
       if (msg?.type === 'session.updated') {
         if (currentCallSid) {
           const st = getState(currentCallSid);
@@ -1864,7 +1838,6 @@ wss.on('connection', (twilioWS, req) => {
         }
       }
 
-      // BARGE-IN events
       if (msg?.type === 'input_audio_buffer.speech_started') {
         handleBargeInStart('input_audio_buffer.speech_started');
         if (currentCallSid) bumpActivity(currentCallSid, 'speech_started');
@@ -1936,17 +1909,18 @@ wss.on('connection', (twilioWS, req) => {
             const callSidParam = getP('callSid');
             const reasonParam = getP('reason');
             const themeParam = getP('theme');
+            const recipientNameParam = getP('recipientName');
 
             console.log('Start.customParameters raw =', params);
-            console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid: callSidParam, reason: reasonParam, theme: themeParam });
+            console.log('Parsed start params =', { from, to, callerName: callerNameParam, callSid: callSidParam, reason: reasonParam, theme: themeParam, recipientName: recipientNameParam });
 
-            // ✅ Better: if callSid wasn't provided, trust data.start.callSid
             currentCallSid = callSidParam || startCallSid || currentCallSid;
             callerFrom = from || callerFrom;
             callerName = callerNameParam || callerName;
 
             callReason = String(reasonParam || '').trim();
             callTheme = safeTheme(themeParam || '');
+            callRecipientName = String(recipientNameParam || '').trim();
 
             if (currentCallSid) {
               const s = getState(currentCallSid);
@@ -1958,26 +1932,23 @@ wss.on('connection', (twilioWS, req) => {
               if (!s.meta.startedAt) s.meta.startedAt = new Date();
               resetIdleTimer(currentCallSid);
 
-              // outbound flags
               const isOutbound = String(callerNameParam || '').toUpperCase() === 'OUTBOUND';
               s.meta.outbound.isOutbound = isOutbound;
               s.meta.outbound.reason = callReason || '';
               s.meta.outbound.theme = callTheme || '';
+              s.meta.outbound.recipientName = callRecipientName || '';
 
-              // reset greeting readiness for this call
               s.aiSessionReady = false;
               s.greetedOnce = false;
               s.greetingPending = false;
               if (s.greetingTimer) { clearTimeout(s.greetingTimer); s.greetingTimer = null; }
 
-              // reset identity defaults for this call until config is applied
               s.selectedVoice = 'marin';
               s.assistantName = 'Trinity';
               selectedVoice = 'marin';
               assistantName = 'Trinity';
             }
 
-            // CNAM auto mode: if spam/scam name and not only-on-phrase, press default digits (back-compat)
             if (AUTO_DNC_ENABLE && AUTO_DNC_ON_CNAM && !AUTO_DNC_ONLY_PHRASE) {
               const s = getState(currentCallSid);
               if (isCnamSpam(s.meta.callerName)) {
@@ -1994,7 +1965,6 @@ wss.on('connection', (twilioWS, req) => {
             aiWS.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
           }
 
-          // Schedule greeting AFTER on-start config; it will speak only after session.updated
           scheduleGreetingAttempt();
           break;
         }
